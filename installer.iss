@@ -2,18 +2,26 @@
 ; Compile with: ISCC.exe installer.iss   (output -> dist\AnsysElasticLicenceMonitor-Setup.exe)
 ;
 ; To pre-fill the "Central config location" wizard prompt for an internal build,
-; pass the value on the ISCC command line:
+; either:
 ;
-;   ISCC.exe /DDefaultConfigSource="\\fileserver\share\config.json" installer.iss
-;   ISCC.exe /DDefaultConfigSource="https://example.com/config.json" installer.iss
+;   1. Drop a build-config.iss file (gitignored) next to installer.iss containing:
+;        #define DefaultConfigSource "G:\path\to\config.json"
+;      Then run: ISCC.exe installer.iss
+;
+;   2. Pass on the ISCC command line:
+;        ISCC.exe /DDefaultConfigSource="\\fileserver\share\config.json" installer.iss
 ;
 ; The default value is baked into the .exe but is NOT in the public source.
-; Public builds (no /D switch) ship with an empty default.
+; Public builds (no build-config.iss, no /D switch) ship with an empty default.
 ;
 ; This wrapper is a thin file-delivery + invocation shell over install.ps1 /
 ; uninstall.ps1, which remain the canonical install logic. The .exe is currently
 ; UNSIGNED -- testers will see SmartScreen "Windows protected your PC"; tell
 ; them to click "More info" -> "Run anyway".
+
+#if FileExists("build-config.iss")
+  #include "build-config.iss"
+#endif
 
 #ifndef DefaultConfigSource
   #define DefaultConfigSource ""
@@ -93,8 +101,33 @@ Type: filesandordirs; Name: "{app}"
 [Code]
 var
   ConfigSourcePage: TInputQueryWizardPage;
+  BrowseButton: TButton;
+
+procedure BrowseButtonClick(Sender: TObject);
+var
+  Path: string;
+  Lower: string;
+begin
+  Path := Trim(ConfigSourcePage.Values[0]);
+  // Don't pre-populate the dialog if the current value is a URL --
+  // the file picker can't navigate there and would just confuse Windows.
+  Lower := LowerCase(Path);
+  if (Pos('http://', Lower) = 1) or (Pos('https://', Lower) = 1) then
+    Path := '';
+  if GetOpenFileName(
+       'Select central config file',
+       Path,
+       '',
+       'JSON files (*.json)|*.json|All files (*.*)|*.*',
+       'json') then
+    ConfigSourcePage.Values[0] := Path;
+end;
 
 procedure InitializeWizard();
+var
+  EditWidth: Integer;
+  ButtonWidth: Integer;
+  Gap: Integer;
 begin
   ConfigSourcePage := CreateInputQueryPage(
     wpSelectTasks,
@@ -108,10 +141,28 @@ begin
     '  - Mapped drive: Z:\share\config.json' + #13#10 +
     '  - UNC path:     \\fileserver\share\config.json' + #13#10 +
     '  - Local file:   C:\path\config.json' + #13#10 + #13#10 +
-    'Leave blank to use bundled defaults only (detection works without this; ' +
-    'only the perpetual-context enrichment in toast 1 needs it).');
+    'Click Browse to pick a file; for a URL, just type or paste it. Leave blank ' +
+    'to use bundled defaults only.');
   ConfigSourcePage.Add('Config source (optional):', False);
   ConfigSourcePage.Values[0] := '{#DefaultConfigSource}';
+
+  // Add a Browse button to the right of the edit. The text field still works
+  // for URLs (which a file picker can't navigate), so the button is a
+  // convenience for the local/UNC/mapped-drive case, not the only path in.
+  ButtonWidth := ScaleX(75);
+  Gap := ScaleX(8);
+  EditWidth := ConfigSourcePage.Edits[0].Width - ButtonWidth - Gap;
+
+  BrowseButton := TButton.Create(ConfigSourcePage);
+  BrowseButton.Parent  := ConfigSourcePage.Surface;
+  BrowseButton.Caption := 'Browse...';
+  BrowseButton.Width   := ButtonWidth;
+  BrowseButton.Height  := ScaleY(23);
+  BrowseButton.Top     := ConfigSourcePage.Edits[0].Top - ScaleY(1);
+  BrowseButton.Left    := ConfigSourcePage.Edits[0].Left + EditWidth + Gap;
+  BrowseButton.OnClick := @BrowseButtonClick;
+
+  ConfigSourcePage.Edits[0].Width := EditWidth;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
