@@ -3,3 +3,13 @@ dist/
 
 # Per-user Claude Code permission cache (don't share)
 .claude/settings.local.json
+
+# Anything created at install time (dev runs of install.ps1 may create these)
+config-source.txt
+
+# Optional Inno Setup include for site-specific build defaults (e.g. PDV)
+build-config.iss
+
+# Optional local config override (kept here in case anyone wants the layered
+# pattern; common.ps1 doesn't read it today).
+config.local.json

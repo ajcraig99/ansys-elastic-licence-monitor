@@ -148,7 +148,14 @@ The .vbs shim exists to avoid the brief console flash that `powershell.exe -Wind
 
 ### Configuration
 
-Site-specific values live in `config.json` next to `common.ps1`. The agent reads it at dot-source time and overrides the empty defaults. Detection works without any config; the perpetual-context enrichment in toast 1 (the "perpetual X is held by [user]" variant, which uses `lmutil lmstat` to query the local FlexLM server) requires you to set `licenseServer.host`/`port` and `perpetualFeatures`. See README "Configuration" for the key reference.
+Two-tier config load at agent startup:
+
+1. **Bundled `config.json`** next to `common.ps1` — the always-present defaults shipped with the installer. Empty out of the box; detection works without it.
+2. **Central config** at a URL or path read from `config-source.txt` — optional, set during install via the wizard. Layered over tier 1 (any field present wins).
+
+The central source is intended for fleet deployments where you'd rather edit one file on Egnyte / SharePoint / a network share than maintain `config.json` on every workstation. If the central source is unreachable or malformed, the agent logs WARN and uses tier 1 — detection always works.
+
+There is no auto-refresh during the agent loop; central config is read once at startup. To propagate a change, users restart the scheduled task (or their machines). See README "Configuration" for the key reference and the install-time wizard.
 
 ---
 

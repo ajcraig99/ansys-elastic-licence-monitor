@@ -9,12 +9,23 @@ $script:LogFilePath    = Join-Path $script:AppDataDir 'agent.log'
 $script:StateFilePath  = Join-Path $script:AppDataDir 'state.json'
 $script:QueueFilePath  = Join-Path $script:AppDataDir 'toast-queue.jsonl'
 
-# config.json sits next to common.ps1 in both the installed layout (everything
-# under %LOCALAPPDATA%\AnsysElasticLicenceMonitor\) and the dev layout (the
-# repo root). Resolve the script's own directory so dev runs pick up the repo's
-# config.json without needing an install.
-$script:CommonScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$script:ConfigFilePath  = Join-Path $script:CommonScriptDir 'config.json'
+# Two-tier config:
+#   Tier 1: bundled config.json next to common.ps1 (always present, defaults).
+#   Tier 2: central config at a URL or path read from config-source.txt
+#           (set during install via the wizard, optional).
+#
+# Tier 2 layers over tier 1 -- any field present in the central config wins.
+# If config-source.txt is missing or empty, tier 2 is skipped entirely.
+# If the central source can't be reached or parsed, the agent logs WARN and
+# uses whatever tier 1 already loaded (so detection always works).
+#
+# Both files sit next to common.ps1 in both the installed layout (everything
+# under %LOCALAPPDATA%\AnsysElasticLicenceMonitor\) and the dev layout (repo
+# root). Resolving via $PSScriptRoot means dev runs pick up the repo's files
+# without needing an install.
+$script:CommonScriptDir       = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$script:ConfigFilePath        = Join-Path $script:CommonScriptDir 'config.json'
+$script:ConfigSourceFilePath  = Join-Path $script:CommonScriptDir 'config-source.txt'
 
 # Defaults are intentionally empty: detection works without any site config
 # (the (elastic) tag in the ACL log is universal), but the perpetual-context
@@ -22,12 +33,7 @@ $script:ConfigFilePath  = Join-Path $script:CommonScriptDir 'config.json'
 # you to point it at your site's FlexLM server and list which features you
 # own perpetually. Set those in config.json -- see README.md.
 #
-# Import-AppConfig at the bottom of this file overwrites these defaults from
-# config.json when present.
-#
-# Phase B (planned): a daily check pulls a remote config.json from a stable
-# URL and overwrites the local one in place. Hook point will be agent.ps1's
-# main loop; the file format here is the contract.
+# Import-AppConfig at the bottom of this file overwrites these defaults.
 $script:LicServerHost       = ''
 $script:LicServerPort       = 0
 $script:PerpetualFeatures   = @()
@@ -61,25 +67,60 @@ function Write-AgentLog {
     Add-Content -Path $script:LogFilePath -Value $line
 }
 
-function Import-AppConfig {
-    # Overrides the hardcoded defaults at the top of this file with values from
-    # config.json next to common.ps1, when present. Any missing field falls
-    # back to the default. Malformed JSON is logged and ignored (defaults stand).
-    if (-not (Test-Path $script:ConfigFilePath)) { return }
+function Get-CentralConfigText {
+    # Reads config-source.txt to get the central-config location, then fetches
+    # that resource. Returns the raw JSON text on success, $null on any failure
+    # (file missing, source field empty, fetch error). Caller decides what to
+    # do with $null (typically: skip tier 2, leave tier 1 values in place).
+    if (-not (Test-Path $script:ConfigSourceFilePath)) { return $null }
+    $source = (Get-Content -Path $script:ConfigSourceFilePath -Raw -ErrorAction SilentlyContinue)
+    if ($null -eq $source) { return $null }
+    $source = $source.Trim()
+    if ([string]::IsNullOrWhiteSpace($source)) { return $null }
+
     try {
-        $cfg = Get-Content -Path $script:ConfigFilePath -Raw -ErrorAction Stop |
-            ConvertFrom-Json -ErrorAction Stop
+        if ($source -match '^(?i)https?://') {
+            # HTTP(S) fetch. UseBasicParsing avoids the IE-engine dependency.
+            $resp = Invoke-WebRequest -Uri $source -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            return [string]$resp.Content
+        }
+        # Anything else -- UNC, mapped drive, local absolute or relative path --
+        # is just a filesystem read. Windows resolves drive mappings transparently
+        # in the user's logon session.
+        if (-not (Test-Path -LiteralPath $source)) {
+            Write-AgentLog "Central config source '$source' not reachable yet (mapping may not be ready). Using bundled defaults." -Level WARN
+            return $null
+        }
+        return Get-Content -LiteralPath $source -Raw -ErrorAction Stop
     } catch {
-        Write-AgentLog "Failed to parse config.json at $script:ConfigFilePath : $_. Using built-in defaults." -Level WARN
-        return
+        Write-AgentLog "Failed to read central config from '$source' : $_. Using bundled defaults." -Level WARN
+        return $null
+    }
+}
+
+function Merge-AppConfigJson {
+    # Parses the supplied JSON text and overlays its fields onto the script-
+    # scoped config vars. Each known field is checked individually so a partial
+    # central config (e.g. only featureDisplayNames overridden) Just Works.
+    # Returns $true if any field was overridden, $false otherwise.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $false }
+    try {
+        $cfg = $Json | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-AgentLog "Failed to parse config JSON: $_. Skipping this tier." -Level WARN
+        return $false
     }
 
+    $changed = $false
     if ($cfg.PSObject.Properties.Name -contains 'licenseServer' -and $cfg.licenseServer) {
-        if ($cfg.licenseServer.host) { $script:LicServerHost = [string]$cfg.licenseServer.host }
-        if ($cfg.licenseServer.port) { $script:LicServerPort = [int]$cfg.licenseServer.port }
+        if ($cfg.licenseServer.host) { $script:LicServerHost = [string]$cfg.licenseServer.host; $changed = $true }
+        if ($cfg.licenseServer.port) { $script:LicServerPort = [int]$cfg.licenseServer.port;   $changed = $true }
     }
     if ($cfg.PSObject.Properties.Name -contains 'perpetualFeatures' -and $cfg.perpetualFeatures) {
         $script:PerpetualFeatures = @($cfg.perpetualFeatures | ForEach-Object { [string]$_ })
+        $changed = $true
     }
     if ($cfg.PSObject.Properties.Name -contains 'featureDisplayNames' -and $cfg.featureDisplayNames) {
         $h = @{}
@@ -87,8 +128,36 @@ function Import-AppConfig {
             $h[$p.Name] = [string]$p.Value
         }
         $script:FeatureDisplayNames = $h
+        $changed = $true
     }
-    Write-AgentLog "Loaded config.json: server=$($script:LicServerHost):$($script:LicServerPort) perpetualFeatures=$($script:PerpetualFeatures -join ',')" -Level DEBUG
+    return $changed
+}
+
+function Import-AppConfig {
+    # Two-tier load:
+    #   Tier 1: bundled config.json (defaults, always tried first)
+    #   Tier 2: central config from config-source.txt (overrides tier 1 if set
+    #           and reachable)
+    # On any failure the agent silently falls back to whatever previous tier
+    # already populated -- so a broken central source never breaks detection.
+    $tier1Loaded = $false
+    if (Test-Path $script:ConfigFilePath) {
+        try {
+            $tier1Json = Get-Content -Path $script:ConfigFilePath -Raw -ErrorAction Stop
+            $tier1Loaded = Merge-AppConfigJson -Json $tier1Json
+        } catch {
+            Write-AgentLog "Failed to parse bundled config.json at $script:ConfigFilePath : $_. Using built-in defaults." -Level WARN
+        }
+    }
+
+    $tier2Json = Get-CentralConfigText
+    $tier2Loaded = $false
+    if ($null -ne $tier2Json) {
+        $tier2Loaded = Merge-AppConfigJson -Json $tier2Json
+    }
+
+    Write-AgentLog ("Config load: tier1(config.json)={0} tier2(central)={1} server={2}:{3} perpetualFeatures={4}" -f `
+        $tier1Loaded, $tier2Loaded, $script:LicServerHost, $script:LicServerPort, ($script:PerpetualFeatures -join ',')) -Level DEBUG
 }
 
 function Get-ActiveAnsysclSessions {

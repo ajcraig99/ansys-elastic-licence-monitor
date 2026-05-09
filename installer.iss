@@ -1,10 +1,23 @@
 ; Inno Setup script for Ansys Elastic Licence Monitor.
 ; Compile with: ISCC.exe installer.iss   (output -> dist\AnsysElasticLicenceMonitor-Setup.exe)
 ;
+; To pre-fill the "Central config location" wizard prompt for an internal build,
+; pass the value on the ISCC command line:
+;
+;   ISCC.exe /DDefaultConfigSource="\\fileserver\share\config.json" installer.iss
+;   ISCC.exe /DDefaultConfigSource="https://example.com/config.json" installer.iss
+;
+; The default value is baked into the .exe but is NOT in the public source.
+; Public builds (no /D switch) ship with an empty default.
+;
 ; This wrapper is a thin file-delivery + invocation shell over install.ps1 /
 ; uninstall.ps1, which remain the canonical install logic. The .exe is currently
 ; UNSIGNED -- testers will see SmartScreen "Windows protected your PC"; tell
 ; them to click "More info" -> "Run anyway".
+
+#ifndef DefaultConfigSource
+  #define DefaultConfigSource ""
+#endif
 
 [Setup]
 ; AppId is fixed forever -- changing it breaks upgrade detection on installed machines.
@@ -76,3 +89,42 @@ Filename: "powershell.exe"; \
 ; Wipe agent.log, state.json, toast-queue.jsonl, and any rotated log backups
 ; that Inno did not put there itself.
 Type: filesandordirs; Name: "{app}"
+
+[Code]
+var
+  ConfigSourcePage: TInputQueryWizardPage;
+
+procedure InitializeWizard();
+begin
+  ConfigSourcePage := CreateInputQueryPage(
+    wpSelectTasks,
+    'Central configuration source',
+    'Where should the agent fetch its site-specific configuration from?',
+    'Optional. Enter a URL or path to a JSON file containing site-specific overrides ' +
+    '(licence server, perpetual feature list, display names). The agent reads this ' +
+    'once at startup, falling back to the bundled defaults on failure.' + #13#10 + #13#10 +
+    'Supported formats:' + #13#10 +
+    '  - HTTPS URL:    https://example.com/config.json' + #13#10 +
+    '  - Mapped drive: Z:\share\config.json' + #13#10 +
+    '  - UNC path:     \\fileserver\share\config.json' + #13#10 +
+    '  - Local file:   C:\path\config.json' + #13#10 + #13#10 +
+    'Leave blank to use bundled defaults only (detection works without this; ' +
+    'only the perpetual-context enrichment in toast 1 needs it).');
+  ConfigSourcePage.Add('Config source (optional):', False);
+  ConfigSourcePage.Values[0] := '{#DefaultConfigSource}';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ConfigSource: string;
+  SourceFilePath: string;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    ConfigSource := Trim(ConfigSourcePage.Values[0]);
+    SourceFilePath := ExpandConstant('{app}\config-source.txt');
+    // Always write the file (possibly empty) so a re-install with a cleared
+    // value reliably wipes a previous setting.
+    SaveStringToFile(SourceFilePath, ConfigSource, False);
+  end;
+end;

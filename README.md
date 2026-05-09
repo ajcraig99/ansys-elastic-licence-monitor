@@ -101,9 +101,33 @@ Key reference:
 
 The installer ships `config.json` with `onlyifdoesntexist`, so admin edits survive in-place reinstalls. To force a config reset: uninstall (which wipes the install dir) then reinstall, or delete the file before reinstalling.
 
-### Phase B: remote config refresh (planned, not built)
+### Central config (multi-machine deployments)
 
-`config.json` is the contract for a future once-a-day fetch from a stable URL (raw.githubusercontent.com against a release tag, or your own hosted equivalent). Plan: agent loop checks the URL once every N hours, compares to local copy, overwrites in place if newer. Code-update (replacing the .ps1 files) is held until code signing is in. Phase B is data-only.
+For fleet deployments where you'd rather not hand-edit `config.json` on every machine, the installer wizard prompts for an optional **central config location**. Anything you enter is saved to `config-source.txt` next to `common.ps1`; the agent reads from that location at startup and layers it over the bundled `config.json` (any field present centrally wins).
+
+Supported source formats:
+
+| Form | Example | Notes |
+|---|---|---|
+| HTTPS URL | `https://files.example.com/share/config.json` | Public/anonymous endpoints work directly. Auth-protected endpoints require the URL itself to embed access (e.g. SharePoint shared link, Egnyte share link). |
+| Mapped drive | `Z:\share\config.json` | Resolved in the user's logon session. If the drive isn't mapped yet at agent startup (rare race), enrichment uses bundled defaults until next startup. |
+| UNC path | `\\fileserver\share\config.json` | Integrated AD auth. |
+| Local file | `C:\path\config.json` | Mostly for testing. |
+| *(blank)* | | Use bundled `config.json` only. |
+
+**Refresh cadence**: agent startup. To propagate a central-config change, users restart their machines (or the scheduled task — `Stop-ScheduledTask 'Ansys Elastic Licence Monitor' ; Start-ScheduledTask 'Ansys Elastic Licence Monitor'`).
+
+**On fetch failure** (network down, file removed, malformed JSON): the agent logs a WARN to `agent.log` and uses bundled defaults — detection still works, just without the perpetual-context enrichment until the central source is reachable again.
+
+### Pre-filling the wizard for an internal build
+
+If you want your team's installer to default to a specific central source so users just click Next, pass `/DDefaultConfigSource="..."` on the ISCC command line:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DDefaultConfigSource="\\fileserver\share\config.json" .\installer.iss
+```
+
+The default value is baked into your built `.exe` but is **not** in the public source code. Public builds (no `/D` switch) ship with an empty default. To avoid having to remember the flag, drop the value into a gitignored file (`build-config.iss` is ignored by default) and `#include` it from your local `installer.iss` if you want — anything outside the tracked source stays private.
 
 ## Paths
 
@@ -237,7 +261,7 @@ Remove-Item "$env:LOCALAPPDATA\AnsysElasticLicenceMonitor\state.json" -ErrorActi
 |---|---|
 | Code signing | First-launch SmartScreen friction is the biggest UX issue. EV cert + signtool integration in the build. |
 | BurntToast offline bundle | `install.ps1` still pulls BurntToast from PSGallery. For locked-down or offline machines, bundle the module locally and have install.ps1 prefer the local copy. |
-| Phase B remote config refresh | Designed (see Configuration above), not built. |
+| Periodic central-config refresh | Currently startup-only. If users complain about restart-to-see-config-change being slow, add an N-hour refresh loop in `agent.ps1`. |
 | Cost annotation in toasts | Requires the ANSYS consumption rate table (AEU/hr per feature) plus your $/AEU contracted figure plus a name mapping from ACL feature names to rate-table feature names. |
 | Hero image / colour emoji in toasts | BurntToast supports `New-BTImage` for hero images. Text styling is locked by Windows but emoji ship their own colour. |
 | WPF dialog as toast 2 alternative | If toast prominence proves insufficient. Real window, any colour, can take focus. ~50 lines. |
