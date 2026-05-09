@@ -1,0 +1,9 @@
+{
+  "_help": "Site overrides for Ansys Elastic Licence Monitor. Detection works without any of these set; the perpetual-context enrichment in toast 1 (the 'Perpetual X is held by [user]' variant) requires you to point the agent at your FlexLM server and list which features you own perpetually. See README.md 'Configuration' for the full key reference.",
+  "licenseServer": {
+    "host": "",
+    "port": 0
+  },
+  "perpetualFeatures": [],
+  "featureDisplayNames": {}
+}

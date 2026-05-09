@@ -1,0 +1,17 @@
+ANSYS Common Licensing Client 25.1
+INFO ANSYS_LICENSING_SERVICE_PRIORITY=fnp,web-elastic
+INFO ANSYSLI_CLIENT_IDLE_TIMEOUT=0
+
+A = number of licenses requested by this ACTION
+B = number of licenses used by this USER
+C = number of licenses used by all users
+D = number of licenses available in the local license pool
+
+2026/05/08 13:10:11    CHECKOUT    mech_1    25.1 (2024.1030)    1/1/1/1   13164:35872:MECH:user.name@WORKSTATION-A:1:console
+2026/05/08 13:10:28    CHECKOUT    rdpara (elastic)    25.1 (2024.1030)    1/1/1/1   13164:35872:PARTMGR:user.name@WORKSTATION-A:1:console
+2026/05/08 13:23:58    SPLIT_CHECKOUT    anshpc (elastic)    25.1 (2024.1030)    4/4/4/4   44116:35872:ANSYS:user.name@WORKSTATION-A:1:console
+2026/05/08 13:30:14    CHECKOUT    advanced_meshing    25.1 (2024.1030)    1/1/1/1   13164:35872:MECH:user.name@WORKSTATION-A:1:console
+2026/05/08 13:45:00    CHECKIN    rdpara (elastic)    25.1 (2024.1030)    1/0/0/0   13164:35872:PARTMGR:user.name@WORKSTATION-A:1:console
+2026/05/08 13:45:01    CHECKIN    anshpc (elastic)    25.1 (2024.1030)    4/0/0/0   44116:35872:ANSYS:user.name@WORKSTATION-A:1:console
+2026/05/08 13:45:02    CHECKIN    mech_1    25.1 (2024.1030)    1/0/0/0   13164:35872:MECH:user.name@WORKSTATION-A:1:console
+2026/05/08 13:45:03    CHECKIN    advanced_meshing    25.1 (2024.1030)    1/0/0/0   13164:35872:MECH:user.name@WORKSTATION-A:1:console
