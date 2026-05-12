@@ -40,6 +40,19 @@ $script:PerpetualFeatures   = @()
 $script:FeatureDisplayNames = @{}
 $script:LmutilPath = $null
 
+# Compliance check. See Test-AnsysConfig / New-AnsysConfigFixBat below.
+# Empty/missing -> check disabled, fully backward compatible.
+$script:ExpectedConfig = @{
+    AnsyslmdServer         = ''
+    ForbiddenUserEnvVars   = @()
+    RequiredLicenseOptions = @{}    # AppPrefix -> ExpectedActiveLicenseName
+}
+
+# Canonical paths for the compliance check. Defined here so test scripts can
+# parameter-override them against fixtures.
+$script:AnsyslmdIniPath  = 'C:\Program Files\ANSYS Inc\Shared Files\licensing\ansyslmd.ini'
+$script:AnsysUserAppData = Join-Path $env:APPDATA 'Ansys'   # contains v251, v242, ...
+
 # Validated against real ACL logs. See docs/ARCHITECTURE.md "Detection signal".
 $script:ElasticCheckoutPattern =
     '^(?<ts>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\s+' +
@@ -129,6 +142,25 @@ function Merge-AppConfigJson {
         }
         $script:FeatureDisplayNames = $h
         $changed = $true
+    }
+    if ($cfg.PSObject.Properties.Name -contains 'expectedConfig' -and $cfg.expectedConfig) {
+        $ec = $cfg.expectedConfig
+        if ($ec.PSObject.Properties.Name -contains 'ansyslmdServer' -and $ec.ansyslmdServer) {
+            $script:ExpectedConfig.AnsyslmdServer = [string]$ec.ansyslmdServer
+            $changed = $true
+        }
+        if ($ec.PSObject.Properties.Name -contains 'forbiddenUserEnvVars' -and $ec.forbiddenUserEnvVars) {
+            $script:ExpectedConfig.ForbiddenUserEnvVars = @($ec.forbiddenUserEnvVars | ForEach-Object { [string]$_ })
+            $changed = $true
+        }
+        if ($ec.PSObject.Properties.Name -contains 'requiredLicenseOptions' -and $ec.requiredLicenseOptions) {
+            $h = @{}
+            foreach ($p in $ec.requiredLicenseOptions.PSObject.Properties) {
+                $h[$p.Name] = [string]$p.Value
+            }
+            $script:ExpectedConfig.RequiredLicenseOptions = $h
+            $changed = $true
+        }
     }
     return $changed
 }
@@ -310,7 +342,7 @@ function Read-ToastQueue {
 }
 
 function Load-State {
-    $default = @{ sessions = @{} }
+    $default = @{ sessions = @{}; config_check = @{ last_run_at = ''; ignored_hash = '' } }
     if (-not (Test-Path $script:StateFilePath)) { return $default }
     try {
         $obj = Get-Content $script:StateFilePath -Raw | ConvertFrom-Json
@@ -336,7 +368,16 @@ function Load-State {
                 }
             }
         }
-        return @{ sessions = $sessions }
+        $configCheck = @{ last_run_at = ''; ignored_hash = '' }
+        if ($obj.PSObject.Properties.Name -contains 'config_check' -and $obj.config_check) {
+            if ($obj.config_check.PSObject.Properties.Name -contains 'last_run_at') {
+                $configCheck.last_run_at = [string]$obj.config_check.last_run_at
+            }
+            if ($obj.config_check.PSObject.Properties.Name -contains 'ignored_hash') {
+                $configCheck.ignored_hash = [string]$obj.config_check.ignored_hash
+            }
+        }
+        return @{ sessions = $sessions; config_check = $configCheck }
     } catch {
         Write-AgentLog "Failed to load state, starting fresh: $_" -Level WARN
         return $default
@@ -445,6 +486,305 @@ function Get-PerpetualContext {
     } catch {
         Write-AgentLog "lmutil call failed for $Feature : $_" -Level WARN
         return $null
+    }
+}
+
+function Get-ExpectedAnsysServer {
+    # The expected ansyslmd.ini SERVER= value. Prefer an explicit override in
+    # expectedConfig.ansyslmdServer; otherwise derive from licenseServer.
+    # Returns '' if neither is set (which means the server check is skipped).
+    if ($script:ExpectedConfig.AnsyslmdServer) { return $script:ExpectedConfig.AnsyslmdServer }
+    if ($script:LicServerHost -and $script:LicServerPort) {
+        return "$($script:LicServerPort)@$($script:LicServerHost)"
+    }
+    return ''
+}
+
+function Test-AnsysConfig {
+    # Compares the live workstation config against $script:ExpectedConfig.
+    # Returns an array of findings; empty means compliant. Each finding is a
+    # hashtable with: key, expected, actual, fixDescription.
+    #
+    # Parameters exist so tests can point this at fixture paths.
+    param(
+        [string]$AnsyslmdIniPath  = $script:AnsyslmdIniPath,
+        [string]$AnsysUserAppData = $script:AnsysUserAppData
+    )
+    $findings = @()
+
+    # --- ansyslmd.ini ---
+    $expectedServer = Get-ExpectedAnsysServer
+    if ($expectedServer) {
+        $actualServer = ''
+        if (Test-Path -LiteralPath $AnsyslmdIniPath) {
+            try {
+                foreach ($line in (Get-Content -LiteralPath $AnsyslmdIniPath -ErrorAction Stop)) {
+                    if ($line -match '^\s*SERVER\s*=\s*(.+?)\s*$') {
+                        $actualServer = $Matches[1]
+                        break
+                    }
+                }
+            } catch {
+                Write-AgentLog "Failed to read $AnsyslmdIniPath : $_" -Level WARN
+            }
+        }
+        if ($actualServer -ne $expectedServer) {
+            $findings += @{
+                key             = 'server.ansyslmd_ini'
+                expected        = $expectedServer
+                actual          = $actualServer
+                fixDescription  = "Set $AnsyslmdIniPath to 'SERVER=$expectedServer'"
+            }
+        }
+    }
+
+    # --- forbidden user env vars ---
+    foreach ($name in @($script:ExpectedConfig.ForbiddenUserEnvVars)) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $val = [Environment]::GetEnvironmentVariable($name, 'User')
+        if (-not [string]::IsNullOrEmpty($val)) {
+            $findings += @{
+                key             = "env.$name"
+                expected        = '<unset>'
+                actual          = $val
+                fixDescription  = "Delete user environment variable $name"
+            }
+        }
+    }
+
+    # --- per-app *LicenseOptions.xml across all installed Ansys versions ---
+    $reqLO = $script:ExpectedConfig.RequiredLicenseOptions
+    if ($reqLO -and $reqLO.Count -gt 0 -and (Test-Path -LiteralPath $AnsysUserAppData)) {
+        $versionDirs = Get-ChildItem -LiteralPath $AnsysUserAppData -Directory -Filter 'v*' -ErrorAction SilentlyContinue
+        foreach ($v in $versionDirs) {
+            foreach ($app in $reqLO.Keys) {
+                $expectedName = [string]$reqLO[$app]
+                if (-not $expectedName) { continue }
+                $xmlPath = Join-Path $v.FullName "$($app)LicenseOptions.xml"
+                if (-not (Test-Path -LiteralPath $xmlPath)) { continue }   # app not installed for this version
+                $actualName = ''
+                try {
+                    [xml]$doc = Get-Content -LiteralPath $xmlPath -Raw -ErrorAction Stop
+                    $node = $doc.SelectSingleNode("//LicenseInfo[@Active='1']")
+                    if ($node) { $actualName = [string]$node.LicenseName }
+                } catch {
+                    Write-AgentLog "Failed to parse $xmlPath : $_" -Level WARN
+                }
+                if ($actualName -ne $expectedName) {
+                    $findings += @{
+                        key             = "licopt.$app.$($v.Name)"
+                        expected        = $expectedName
+                        actual          = $actualName
+                        fixDescription  = "Set $xmlPath active licence to '$expectedName'"
+                        xml_path        = $xmlPath
+                        app_prefix      = $app
+                    }
+                }
+            }
+        }
+    }
+
+    return ,$findings
+}
+
+function Get-AnsysConfigFindingsHash {
+    # Stable SHA1 over the {key,expected,actual} triplets so that a user's
+    # "Ignore" choice silences exactly this set of findings, but re-toasts
+    # if either the actual or the expected side changes.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$Findings)
+    if ($Findings.Count -eq 0) { return '' }
+    $sorted = $Findings | Sort-Object { $_.key }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($f in $sorted) {
+        [void]$sb.AppendLine("$($f.key)|$($f.expected)|$($f.actual)")
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($sb.ToString())
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+        return -join ($hash | ForEach-Object { $_.ToString('x2') })
+    } finally { $sha.Dispose() }
+}
+
+function New-AnsysConfigFixBat {
+    # Generates a self-contained .bat the user can run as admin to remediate
+    # everything in $Findings. Each PowerShell fix is passed via -EncodedCommand
+    # (Base64 UTF-16LE) so we sidestep cmd<->PowerShell quoting entirely --
+    # the previous inline-quoted approach silently produced a string literal
+    # instead of executing Set-Content.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Findings,
+        [Parameter(Mandatory)][string]$OutPath
+    )
+
+    # PS-literal-escape: wrap in single quotes, double any embedded singles.
+    function Escape-PsSQ([string]$s) {
+        if ($null -eq $s) { return "''" }
+        return "'" + $s.Replace("'", "''") + "'"
+    }
+
+    function ConvertTo-EncodedPsCommand([string]$Code) {
+        # PowerShell's -EncodedCommand expects UTF-16LE bytes, then Base64.
+        $bytes = [System.Text.Encoding]::Unicode.GetBytes($Code)
+        return [Convert]::ToBase64String($bytes)
+    }
+
+    $lines = @()
+    $lines += '@echo off'
+    $lines += 'setlocal'
+    $lines += 'echo Ansys Elastic Licence Monitor - configuration repair'
+    $lines += "echo Applying $($Findings.Count) fix(es)..."
+    $lines += 'echo.'
+    $lines += 'set FAILED=0'
+    $lines += ''
+
+    foreach ($f in $Findings) {
+        switch -Wildcard ($f.key) {
+            'server.ansyslmd_ini' {
+                $iniPath = $script:AnsyslmdIniPath
+                $line    = "SERVER=$($f.expected)"
+                $cmd = "Set-Content -LiteralPath $(Escape-PsSQ $iniPath) -Value $(Escape-PsSQ $line) -Encoding ASCII"
+                $enc = ConvertTo-EncodedPsCommand $cmd
+                $lines += "REM Fix: $($f.key)"
+                $lines += "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc"
+                $lines += 'if errorlevel 1 ( echo  FAILED: ansyslmd.ini write && set FAILED=1 ) else echo  OK: ansyslmd.ini'
+                $lines += ''
+                continue
+            }
+            'env.*' {
+                $name = $f.key.Substring(4)
+                $lines += "REM Fix: $($f.key)"
+                $lines += "reg delete `"HKCU\Environment`" /v $name /f >nul 2>&1"
+                $lines += "if errorlevel 1 ( echo  FAILED: delete env $name && set FAILED=1 ) else echo  OK: cleared env $name"
+                $lines += ''
+                continue
+            }
+            'licopt.*' {
+                $xmlPath = [string]$f.xml_path
+                $expName = [string]$f.expected
+                # Single-line XML so the cmd.exe argument stays on one line.
+                # XML whitespace is insignificant; ANSYS reads structure, not formatting.
+                $xml = "<Licenses><LicenseInfo Active=`"1`" LicenseName=`"$expName`"/></Licenses>"
+                $cmd = "Set-Content -LiteralPath $(Escape-PsSQ $xmlPath) -Value $(Escape-PsSQ $xml) -Encoding UTF8"
+                $enc = ConvertTo-EncodedPsCommand $cmd
+                $lines += "REM Fix: $($f.key)"
+                $lines += "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $enc"
+                $lines += "if errorlevel 1 ( echo  FAILED: $($f.app_prefix) XML && set FAILED=1 ) else echo  OK: $($f.app_prefix) XML"
+                $lines += ''
+                continue
+            }
+            default {
+                $lines += "REM Skipping unknown finding key: $($f.key)"
+            }
+        }
+    }
+
+    $lines += 'echo.'
+    $lines += 'if "%FAILED%"=="0" ( echo Done. Close and re-open ANSYS for changes to take effect. ) else ( echo Some fixes failed. See messages above. )'
+    $lines += 'pause'
+    $lines += 'endlocal'
+
+    $parent = Split-Path -Parent $OutPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    # CRLF + ASCII so cmd.exe parses cleanly on every Windows locale.
+    Set-Content -LiteralPath $OutPath -Value ($lines -join "`r`n") -Encoding ASCII
+    return $OutPath
+}
+
+function Invoke-AnsysConfigFixLaunch {
+    # Launches the generated .bat elevated. UAC prompt is shown to the user.
+    # Returns $true if the launch succeeded (user is expected to approve UAC
+    # next); $false if launch failed or the user declined elevation.
+    param([Parameter(Mandatory)][string]$BatPath)
+    if (-not (Test-Path -LiteralPath $BatPath)) {
+        Write-AgentLog "Fix bat missing at $BatPath" -Level ERROR
+        return $false
+    }
+    try {
+        Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', "`"$BatPath`"") -Verb RunAs -ErrorAction Stop | Out-Null
+        Write-AgentLog "Launched fix bat elevated: $BatPath"
+        return $true
+    } catch {
+        # UAC decline throws System.ComponentModel.Win32Exception "The operation was canceled by the user".
+        Write-AgentLog "Fix bat launch failed (likely UAC decline): $_" -Level WARN
+        return $false
+    }
+}
+
+function Show-ConfigMismatchToast {
+    # Caller is responsible for Import-Module BurntToast before calling.
+    param([Parameter(Mandatory)][int]$FindingCount)
+    try {
+        $btnFix    = New-BTButton -Content "Fix it"  -Arguments "ansyselastic:fix_config?session=config"    -ActivationType Protocol
+        $btnIgnore = New-BTButton -Content "Ignore"  -Arguments "ansyselastic:ignore_config?session=config" -ActivationType Protocol
+
+        $headerText = New-BTText -Content "ANSYS configuration check"
+        $bodyText   = New-BTText -Content "Your ANSYS licence configuration differs from site standard in $FindingCount place(s). This can cause silent elastic-licence consumption. Click 'Fix it' to apply the standard (requires admin approval) or 'Ignore' to silence this check."
+
+        $binding = New-BTBinding -Children $headerText, $bodyText
+        $visual  = New-BTVisual  -BindingGeneric $binding
+        $actions = New-BTAction  -Buttons $btnFix, $btnIgnore
+        $audio   = New-BTAudio   -Source 'ms-winsoundevent:Notification.Reminder'
+        # Body click routed to fix_config to match the primary button (safer
+        # default than ignore_config, since the user can still cancel UAC).
+        $content = New-BTContent -Visual $visual -Actions $actions -Audio $audio `
+                                 -Launch "ansyselastic:fix_config?session=config" -ActivationType Protocol
+
+        Submit-BTNotification -Content $content -UniqueIdentifier "config-mismatch"
+        Write-AgentLog "Config-mismatch toast fired ($FindingCount finding(s))"
+    } catch {
+        Write-AgentLog "Config-mismatch toast failed: $_" -Level ERROR
+    }
+}
+
+function Show-ConfigFixLaunchedToast {
+    try {
+        $headerText = New-BTText -Content "ANSYS configuration repair launched"
+        $bodyText   = New-BTText -Content "An admin-elevation prompt should appear. Approve it to apply the fix. Close and re-open ANSYS afterwards for changes to take effect."
+        $binding = New-BTBinding -Children $headerText, $bodyText
+        $visual  = New-BTVisual  -BindingGeneric $binding
+        $content = New-BTContent -Visual $visual
+        Submit-BTNotification -Content $content -UniqueIdentifier "config-fix-launched"
+    } catch {
+        Write-AgentLog "Config-fix-launched toast failed: $_" -Level ERROR
+    }
+}
+
+function Invoke-ConfigCheckCycle {
+    # One-shot check; called at agent startup and from install.ps1. If findings
+    # exist and the same finding-set hasn't been previously dismissed, fires
+    # the mismatch toast. Mutates $State.config_check; caller is responsible
+    # for Save-State afterwards if persistence is desired.
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [ValidateSet('Agent','Install')][string]$RunMode = 'Agent'
+    )
+    try {
+        $findings = Test-AnsysConfig
+        if ($null -eq $findings) { $findings = @() }
+        if (-not ($State.ContainsKey('config_check'))) {
+            $State['config_check'] = @{ last_run_at = ''; ignored_hash = '' }
+        }
+        $State.config_check.last_run_at = (Get-Date).ToString('o')
+
+        if ($findings.Count -eq 0) {
+            Write-AgentLog "Config check ($RunMode): compliant" -Level DEBUG
+            return
+        }
+        $hash = Get-AnsysConfigFindingsHash -Findings $findings
+        if ($hash -and $hash -eq [string]$State.config_check.ignored_hash) {
+            Write-AgentLog "Config check ($RunMode): $($findings.Count) finding(s) but matching ignored_hash, skipping toast" -Level DEBUG
+            return
+        }
+        Write-AgentLog "Config check ($RunMode): $($findings.Count) finding(s), firing toast"
+        foreach ($f in $findings) {
+            Write-AgentLog ("  finding key={0} expected='{1}' actual='{2}'" -f $f.key, $f.expected, $f.actual)
+        }
+        Show-ConfigMismatchToast -FindingCount $findings.Count
+    } catch {
+        Write-AgentLog "Invoke-ConfigCheckCycle failed: $_" -Level ERROR
     }
 }
 

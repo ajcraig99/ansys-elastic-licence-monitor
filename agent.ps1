@@ -115,6 +115,42 @@ function Step-Agent {
     $clicks = Read-ToastQueue
     foreach ($evt in $clicks) {
         $key = [string]$evt.session_key
+
+        # Compliance-check actions are session-less (key == 'config').
+        if ($evt.action -eq 'fix_config' -or $evt.action -eq 'ignore_config') {
+            if (-not ($State.ContainsKey('config_check'))) {
+                $State.config_check = @{ last_run_at = ''; ignored_hash = '' }
+            }
+            if ($evt.action -eq 'fix_config') {
+                try {
+                    $findings = Test-AnsysConfig
+                    if ($null -eq $findings) { $findings = @() }
+                    if ($findings.Count -eq 0) {
+                        Write-AgentLog "fix_config clicked but no findings remain; nothing to do"
+                    } else {
+                        $batPath = Join-Path $scriptRoot 'fix-ansys-config.bat'
+                        [void](New-AnsysConfigFixBat -Findings $findings -OutPath $batPath)
+                        Write-AgentLog "Generated $batPath with $($findings.Count) fix(es)"
+                        if (Invoke-AnsysConfigFixLaunch -BatPath $batPath) {
+                            Show-ConfigFixLaunchedToast
+                        }
+                    }
+                } catch {
+                    Write-AgentLog "fix_config handling failed: $_" -Level ERROR
+                }
+            } else {
+                try {
+                    $findings = Test-AnsysConfig
+                    if ($null -eq $findings) { $findings = @() }
+                    $State.config_check.ignored_hash = Get-AnsysConfigFindingsHash -Findings $findings
+                    Write-AgentLog "Compliance check ignored by user (hash=$($State.config_check.ignored_hash))"
+                } catch {
+                    Write-AgentLog "ignore_config handling failed: $_" -Level ERROR
+                }
+            }
+            continue
+        }
+
         if (-not $State.sessions.ContainsKey($key)) {
             Write-AgentLog "Click '$($evt.action)' for unknown session $key, ignoring" -Level DEBUG
             continue
@@ -244,6 +280,11 @@ function Step-Agent {
 # Main loop.
 $state = Load-State
 Write-AgentLog ("Loaded {0} session(s) from prior run" -f $state.sessions.Count)
+
+# One-shot compliance check at startup. Toasts only if there are findings the
+# user hasn't already dismissed via "Ignore".
+Invoke-ConfigCheckCycle -State $state -RunMode Agent
+Save-State -State $state
 
 while ($true) {
     try {

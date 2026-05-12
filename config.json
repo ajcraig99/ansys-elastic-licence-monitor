@@ -1,9 +1,14 @@
 {
-  "_help": "Site overrides for Ansys Elastic Licence Monitor. Detection works without any of these set; the perpetual-context enrichment in toast 1 (the 'Perpetual X is held by [user]' variant) requires you to point the agent at your FlexLM server and list which features you own perpetually. See README.md 'Configuration' for the full key reference.",
+  "_help": "Site overrides for Ansys Elastic Licence Monitor. Detection works without any of these set. The perpetual-context enrichment in toast 1 (the 'Perpetual X is held by [user]' variant) requires licenseServer.host/port and perpetualFeatures. The compliance check (expectedConfig) verifies the workstation's licence config against the site standard and offers an admin-elevated bat to repair drift; absent or empty -> check disabled. See README.md 'Configuration' for the full key reference.",
   "licenseServer": {
     "host": "",
     "port": 0
   },
   "perpetualFeatures": [],
-  "featureDisplayNames": {}
+  "featureDisplayNames": {},
+  "expectedConfig": {
+    "ansyslmdServer": "",
+    "forbiddenUserEnvVars": [],
+    "requiredLicenseOptions": {}
+  }
 }

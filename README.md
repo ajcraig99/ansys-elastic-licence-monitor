@@ -25,6 +25,7 @@ Currently distributed unsigned — first run hits Windows SmartScreen ("Windows 
 | `sample-acl-log.log` | Fixture for offline regex test (4 elastic events + 4 perpetual events) |
 | `test-parser.ps1` | Validates regex against fixture |
 | `test-perpetual.ps1` | Probes lmutil + perpetual context parser for each feature |
+| `test-configcheck.ps1` | Validates compliance check + fix-bat generation against fixture paths (no ANSYS install needed) |
 | `docs/ARCHITECTURE.md` | Detection signal, agent design, dead ends, glossary |
 
 ## Architecture in 12 lines
@@ -98,8 +99,27 @@ Key reference:
 | `licenseServer.port` | `0` (empty, enrichment disabled) | FlexLM port (typically 1055) |
 | `perpetualFeatures` | `[]` (empty, enrichment disabled) | ACL feature names eligible for the "held by [user]" enrichment. Without these, those features still trigger detection toasts but lose the per-user context. |
 | `featureDisplayNames` | `{}` | Friendly names shown in toasts. Falls back to raw feature name if not in map. |
+| `expectedConfig.ansyslmdServer` | `""` | Expected `SERVER=` value in `C:\Program Files\ANSYS Inc\Shared Files\licensing\ansyslmd.ini`. Format: `port@host`. Defaults to `"$port@$host"` derived from `licenseServer` if omitted. Empty -> server check skipped. |
+| `expectedConfig.forbiddenUserEnvVars` | `[]` | User-scope env vars that must **not** be set. Typically `["ANSYSLMD_LICENSE_FILE", "ANSYSLI_SERVERS"]` to catch stray overrides of the canonical .ini-based config. |
+| `expectedConfig.requiredLicenseOptions` | `{}` | Map of `<AppPrefix>` → expected active licence name in `%APPDATA%\Ansys\v*\<AppPrefix>LicenseOptions.xml`. e.g. `{"Mechanical": "Ansys Mechanical Pro"}`. Empty -> no per-app XML check. |
 
 The installer ships `config.json` with `onlyifdoesntexist`, so admin edits survive in-place reinstalls. To force a config reset: uninstall (which wipes the install dir) then reinstall, or delete the file before reinstalling.
+
+### Compliance check
+
+In addition to detecting elastic *checkouts*, the agent runs a one-shot compliance check at startup (and again from inside `install.ps1` so a fresh install gets the check immediately). If the workstation's config differs from `expectedConfig`, a toast appears with a `Fix it` / `Ignore` choice.
+
+`Fix it` generates `<install-dir>\fix-ansys-config.bat` from the current findings and launches it with UAC elevation (`Start-Process -Verb RunAs`). The bat:
+
+- Rewrites `C:\Program Files\ANSYS Inc\Shared Files\licensing\ansyslmd.ini` (requires admin — that's why the bat exists rather than fixing in-process from the agent).
+- Deletes any forbidden user env vars from `HKCU\Environment`.
+- Overwrites any non-compliant `<App>LicenseOptions.xml` under the logged-in user's `%APPDATA%\Ansys\v*\`.
+
+UAC elevation keeps the same user identity, so the elevated bat can still write to the logged-in user's `%APPDATA%`. The agent bakes the resolved `%APPDATA%` path into the bat at generation time so that even if a different admin's credentials are used at the UAC prompt, the right user's XML files are fixed.
+
+`Ignore` records a stable hash of the findings and silences the toast for as long as that exact set persists. If the actual or expected side changes, the hash changes and the toast re-fires on next startup. Restarting the agent always re-runs the check.
+
+If `expectedConfig` is empty (default in the public `config.json`), the check is disabled. Set it in your central config to enable, no other plumbing required.
 
 ### Central config (multi-machine deployments)
 
@@ -156,6 +176,15 @@ Scheduled task name: `Ansys Elastic Licence Monitor`.
 - Audio: `ms-winsoundevent:Notification.Reminder`
 - Body click: same as `Got it` (no state change)
 
+**Compliance toast** (fires once at agent startup if `expectedConfig` is set and the workstation differs from it):
+
+- Title: `ANSYS configuration check`
+- Body: *"Your ANSYS licence configuration differs from site standard in {N} place(s). This can cause silent elastic-licence consumption. Click 'Fix it' to apply the standard (requires admin approval) or 'Ignore' to silence this check."*
+- Buttons: `Fix it`, `Ignore`
+- Body click: same as `Fix it` (UAC is still cancellable, so accidental clicks are recoverable).
+
+`Fix it` triggers a follow-up **`ANSYS configuration repair launched`** toast confirming the bat was launched and reminding the user to close and re-open ANSYS for changes to take effect.
+
 **Toast 2** (escalation, fires every `EscalationMinutes` after toast 1 until accepted, suppressed, or session ends):
 
 - Title: `ANSYS Elastic Licensing - action needed`
@@ -183,6 +212,8 @@ The .vbs shim exists to avoid the brief console flash that `powershell.exe -Wind
 | `suppress` | Toast 1 button | state -> SUPPRESSED |
 | `accept` | Toast 2 button | state -> SUPPRESSED |
 | `snooze` | Toast 2 body click | `next_prompt_at` = now + 5 min |
+| `fix_config` | Compliance toast `Fix it` (or body) | Generate `fix-ansys-config.bat` from findings; `Start-Process -Verb RunAs` it (UAC prompt) |
+| `ignore_config` | Compliance toast `Ignore` | Store hash of current findings in `state.config_check.ignored_hash`; same finding-set won't re-toast until it changes or agent restarts with new expected config |
 
 ## Install / uninstall
 
@@ -232,6 +263,9 @@ Output: `.\dist\AnsysElasticLicenceMonitor-Setup.exe` (~2 MB). Bump `AppVersion`
 ```powershell
 # 1. Regex against the fixture
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-parser.ps1
+
+# 1b. Compliance check + fix-bat generation against fixture paths
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-configcheck.ps1
 
 # 2. lmutil + perpetual context parsing against your live licence server
 #    (requires a configured config.json pointing at your FlexLM server)

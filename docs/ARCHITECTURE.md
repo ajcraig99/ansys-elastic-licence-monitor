@@ -157,6 +157,21 @@ The central source is intended for fleet deployments where you'd rather edit one
 
 There is no auto-refresh during the agent loop; central config is read once at startup. To propagate a change, users restart the scheduled task (or their machines). See README "Configuration" for the key reference and the install-time wizard.
 
+### Compliance check + elevated repair bat
+
+In addition to the runtime elastic detection, the agent runs a one-shot compliance check at startup (and again from inside `install.ps1` so a fresh install is checked immediately). It compares the live workstation config against `expectedConfig` from the central config — `ansyslmd.ini`, user-scope env vars, and per-app `<App>LicenseOptions.xml` under `%APPDATA%\Ansys\v*\`. Findings raise a toast with `Fix it` / `Ignore`.
+
+`Fix it` does not perform the fix in-process. Two reasons:
+
+1. **`ansyslmd.ini` lives under `C:\Program Files\ANSYS Inc\Shared Files\licensing\`**, which is not writable by a standard user. The agent itself is per-user, no-admin (`RunLevel Limited`), so it can't rewrite the canonical file in place. A per-user `ANSYSLMD_LICENSE_FILE` env-var override was investigated and rejected because it leaves the stale .ini around as a footgun — re-image / repair / IT "fix licensing" reverts to the wrong server, and the env var shadow makes the failure invisible.
+2. **One mental model.** Per-user fixes (XML, env vars) could be applied in-process without elevation, but splitting fixes across two paths just complicates things. The bat handles everything in one elevated pass.
+
+So the agent generates `<install-dir>\fix-ansys-config.bat` from the current findings and the resolved expected values, then `Start-Process -Verb RunAs` launches it — Windows shows the UAC consent prompt. The user approves and the bat fixes everything; on decline, agent logs WARN and does nothing further (no toast spam).
+
+UAC elevation keeps the same user identity, so the elevated bat's `%APPDATA%` still points at the logged-in user's profile. The agent bakes the resolved path into the bat at generation time anyway, so even if a different admin's credentials are entered at the UAC prompt the right user's XML files get repaired.
+
+`Ignore` stores a stable hash of the findings in `state.config_check.ignored_hash`. The same finding set won't re-toast on subsequent startups. If either the actual or expected side changes, the hash changes and the toast re-fires.
+
 ---
 
 ## 5. Dead ends — don't repeat these

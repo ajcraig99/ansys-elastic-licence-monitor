@@ -115,6 +115,19 @@ Write-Host "  Registered ansyselastic: URL protocol"
 Start-ScheduledTask -TaskName $TaskName
 Write-Host "  Agent started"
 
+# 6. One-shot compliance check from inside the installer so any toast appears
+#    while the user is still in the wizard's Finish page. The scheduled task
+#    will run the same check on its first iteration, but that may be a few
+#    seconds later; running it here is the explicit "on first install" trigger.
+try {
+    Import-Module BurntToast -ErrorAction Stop | Out-Null
+    $installState = Load-State
+    Invoke-ConfigCheckCycle -State $installState -RunMode Install
+    Save-State -State $installState
+} catch {
+    Write-Host "  (Compliance check skipped: $_)"
+}
+
 Write-Host ""
 Write-Host "Install complete."
 Write-Host "  Logs:  $InstallDir\agent.log"

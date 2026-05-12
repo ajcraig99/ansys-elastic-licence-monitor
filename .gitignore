@@ -13,3 +13,7 @@ build-config.iss
 # Optional local config override (kept here in case anyone wants the layered
 # pattern; common.ps1 doesn't read it today).
 config.local.json
+
+# Site-specific central config that gets copied to a network share. Contains
+# real internal hostnames / feature lists, so it stays out of the public repo.
+central-config.json
