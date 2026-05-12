@@ -125,11 +125,10 @@ If `expectedConfig` is empty (default in the public `config.json`), the check is
 
 For fleet deployments where you'd rather not hand-edit `config.json` on every machine, the installer wizard prompts for an optional **central config location**. Anything you enter is saved to `config-source.txt` next to `common.ps1`; the agent reads from that location at startup and layers it over the bundled `config.json` (any field present centrally wins).
 
-Supported source formats:
+Supported source formats (local filesystem only — HTTPS was removed because the URL form confused non-technical users and added a MITM surface for no real benefit):
 
 | Form | Example | Notes |
 |---|---|---|
-| HTTPS URL | `https://files.example.com/share/config.json` | Public/anonymous endpoints work directly. Auth-protected endpoints require the URL itself to embed access (e.g. SharePoint shared link, Egnyte share link). |
 | Mapped drive | `Z:\share\config.json` | Resolved in the user's logon session. If the drive isn't mapped yet at agent startup (rare race), enrichment uses bundled defaults until next startup. |
 | UNC path | `\\fileserver\share\config.json` | Integrated AD auth. |
 | Local file | `C:\path\config.json` | Mostly for testing. |
@@ -137,7 +136,7 @@ Supported source formats:
 
 **Refresh cadence**: agent startup. To propagate a central-config change, users restart their machines (or the scheduled task — `Stop-ScheduledTask 'Ansys Elastic Licence Monitor' ; Start-ScheduledTask 'Ansys Elastic Licence Monitor'`).
 
-**On fetch failure** (network down, file removed, malformed JSON): the agent logs a WARN to `agent.log` and uses bundled defaults — detection still works, just without the perpetual-context enrichment until the central source is reachable again.
+**On fetch failure** (network down, file removed, malformed JSON, file >1 MB): the agent logs a WARN to `agent.log` and uses bundled defaults — detection still works, just without the perpetual-context enrichment until the central source is reachable again.
 
 ### Pre-filling the wizard for an internal build
 
@@ -148,6 +147,19 @@ If you want your team's installer to default to a specific central source so use
 ```
 
 The default value is baked into your built `.exe` but is **not** in the public source code. Public builds (no `/D` switch) ship with an empty default. To avoid having to remember the flag, drop the value into a gitignored file (`build-config.iss` is ignored by default) and `#include` it from your local `installer.iss` if you want — anything outside the tracked source stays private.
+
+### Future-proofing (multi-version ANSYS upgrades)
+
+The agent picks up new ANSYS releases automatically — version directories are enumerated under `C:\Program Files\ANSYS Inc\v*` with numeric sort (so `v100` sorts above `v99` correctly, unlike a plain alphabetic sort). Compliance checks run against **every** installed version directory.
+
+The few couplings to ANSYS internals are overridable in `config.json` if a future release changes them:
+
+| Key | Default | Override when |
+|---|---|---|
+| `detection.processName` | `ansyscl.exe` | ANSYS renames the per-session licensing client |
+| `detection.aclLogDir`   | `%LOCALAPPDATA%\Temp\.ansys` | ANSYS relocates the ACL log directory |
+| `expectedConfig.ansyslmdIniPath` | `C:\Program Files\ANSYS Inc\Shared Files\licensing\ansyslmd.ini` | ANSYS moves the canonical licence config file |
+| `expectedConfig.ansysIncRoots` | `["C:\Program Files\ANSYS Inc","C:\Program Files (x86)\ANSYS Inc"]` | ANSYS changes the install root |
 
 ## Paths
 
@@ -188,11 +200,18 @@ Scheduled task name: `Ansys Elastic Licence Monitor`.
 **Toast 2** (escalation, fires every `EscalationMinutes` after toast 1 until accepted, suppressed, or session ends):
 
 - Title: `ANSYS Elastic Licensing - action needed`
-- Body: *"ANSYS elastic licensing has been in use for {EscalationMinutes} min. Click Accept to acknowledge, or close ANSYS to stop billing."*
-- Button: `Accept - keep using elastic`
+- Body: *"ANSYS elastic licensing has been in use for {EscalationMinutes} min. This costs money for every hour it stays open. Close ANSYS now to stop billing, or click 'Keep billing me' to continue."*
+- Button: `Keep billing me`
 - Audio: `ms-winsoundevent:Notification.Looping.Alarm2` (loops while toast on screen)
 - Scenario: `Reminder` (sticky in Action Center, does not auto-dismiss)
 - Body click: snooze 5 min (not full session silence)
+
+**Startup self-test toast** (fires once at agent startup only if a check fails):
+
+- Title: `ANSYS Elastic Licence Monitor - heads up`
+- Body: lists any startup issues, e.g. *"No ANSYS install detected ... Compliance check and perpetual context will be skipped."*
+- No buttons; the toast points the user at the log.
+- Silent when everything is OK.
 
 ## Toast click handling
 
@@ -258,17 +277,25 @@ Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) on the build machine. E
 
 Output: `.\dist\AnsysElasticLicenceMonitor-Setup.exe` (~2 MB). Bump `AppVersion` in `installer.iss` for each release; **do not change `AppId`** (that GUID identifies the app for upgrade detection on installed machines forever).
 
+## Is the agent running?
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\AnsysElasticLicenceMonitor\agent.ps1" -Status
+```
+
+Prints a one-shot summary: version, discovered ANSYS install, scheduled-task state, whether the agent process is alive. Use this when toasts aren't appearing and you want to confirm the agent is actually up.
+
 ## Testing without installing
 
 ```powershell
-# 1. Regex against the fixture
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-parser.ps1
+# Run all offline tests (syntax check + parser + configcheck)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-all.ps1
 
-# 1b. Compliance check + fix-bat generation against fixture paths
+# Or run each test individually:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-parser.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-configcheck.ps1
 
-# 2. lmutil + perpetual context parsing against your live licence server
-#    (requires a configured config.json pointing at your FlexLM server)
+# Live licence-server smoke test (requires a configured config.json + reachable server)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-perpetual.ps1
 
 # 3. Run the agent in the foreground (Ctrl+C to stop)

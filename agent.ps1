@@ -6,15 +6,45 @@
 param(
     [int]$PollIntervalSeconds            = 10,
     [int]$EscalationMinutes              = 60,
-    [int]$ElasticDetectionThresholdSec   = 30
+    [int]$ElasticDetectionThresholdSec   = 30,
+    # When set, prints a one-shot status summary and exits. For "is the agent
+    # actually doing anything?" troubleshooting without tailing logs.
+    [switch]$Status
 )
+
+Set-StrictMode -Version 3.0
+$ErrorActionPreference = 'Stop'
 
 # Resolve script root robustly when launched via -File.
 $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 . (Join-Path $scriptRoot 'common.ps1')
 
 Initialize-AppDataDir
-Write-AgentLog "agent.ps1 starting (poll=${PollIntervalSeconds}s escalation=${EscalationMinutes}m threshold=${ElasticDetectionThresholdSec}s pid=$PID)"
+
+if ($Status) {
+    # Summary-and-exit path for users who want to know the agent is alive.
+    $version = Get-AgentVersion
+    $envInfo = Get-AnsysEnvironment
+    Write-Host "Ansys Elastic Licence Monitor"
+    Write-Host "  Version            : $version"
+    Write-Host "  Install dir        : $script:AppDataDir"
+    Write-Host "  Log file           : $script:LogFilePath"
+    Write-Host "  State file         : $script:StateFilePath"
+    Write-Host "  ANSYS Inc root     : $($envInfo.AnsysIncRoot)"
+    Write-Host "  Versions detected  : $(@($envInfo.VersionDirs | ForEach-Object { $_.Name }) -join ', ')"
+    Write-Host "  lmutil.exe         : $($envInfo.LmutilPath)"
+    Write-Host "  ansyslmd.ini       : $($envInfo.AnsyslmdIniPath)"
+    Write-Host "  Licence server     : $($script:LicServerHost):$($script:LicServerPort)"
+    Write-Host "  Detection process  : $script:DetectionProcessName"
+    $task = Get-ScheduledTask -TaskName 'Ansys Elastic Licence Monitor' -ErrorAction SilentlyContinue
+    Write-Host "  Scheduled task     : $(if ($task) { "$($task.State)" } else { 'not installed' })"
+    $running = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*agent.ps1*' -and $_.ProcessId -ne $PID }
+    Write-Host "  Agent process      : $(if ($running) { "PID $(@($running).ForEach{ $_.ProcessId } -join ',')" } else { 'not running' })"
+    exit 0
+}
+
+Write-AgentLog "agent.ps1 starting (version=$(Get-AgentVersion) poll=${PollIntervalSeconds}s escalation=${EscalationMinutes}m threshold=${ElasticDetectionThresholdSec}s pid=$PID)"
 
 try {
     Import-Module BurntToast -ErrorAction Stop
@@ -85,10 +115,10 @@ function Show-EscalationToast {
     param([Parameter(Mandatory)][string]$SessionKey)
     try {
         $encodedKey = [System.Uri]::EscapeDataString($SessionKey)
-        $btnAccept  = New-BTButton -Content "Accept - keep using elastic" -Arguments "ansyselastic:accept?session=$encodedKey" -ActivationType Protocol
+        $btnAccept  = New-BTButton -Content "Keep billing me" -Arguments "ansyselastic:accept?session=$encodedKey" -ActivationType Protocol
 
         $headerText = New-BTText -Content "ANSYS Elastic Licensing - action needed"
-        $bodyText   = New-BTText -Content "ANSYS elastic licensing has been in use for $EscalationMinutes min. Click Accept to acknowledge, or close ANSYS to stop billing."
+        $bodyText   = New-BTText -Content "ANSYS elastic licensing has been in use for $EscalationMinutes min. This costs money for every hour it stays open. Close ANSYS now to stop billing, or click 'Keep billing me' to continue."
 
         $binding = New-BTBinding -Children $headerText, $bodyText
         $visual  = New-BTVisual  -BindingGeneric $binding
@@ -114,14 +144,23 @@ function Step-Agent {
     # 1. Drain toast click queue and apply effects.
     $clicks = Read-ToastQueue
     foreach ($evt in $clicks) {
-        $key = [string]$evt.session_key
+        # Queue entries come from JSON written by toast-callback.ps1; under
+        # strict mode we have to guard against any line missing the expected
+        # properties (manual edit, bug in the callback, ...).
+        $evtProps = $evt.PSObject.Properties.Name
+        if ($evtProps -notcontains 'action' -or $evtProps -notcontains 'session_key') {
+            Write-AgentLog "Queue entry missing action/session_key, skipping" -Level WARN
+            continue
+        }
+        $key    = [string]$evt.session_key
+        $action = [string]$evt.action
 
         # Compliance-check actions are session-less (key == 'config').
-        if ($evt.action -eq 'fix_config' -or $evt.action -eq 'ignore_config') {
+        if ($action -eq 'fix_config' -or $action -eq 'ignore_config') {
             if (-not ($State.ContainsKey('config_check'))) {
                 $State.config_check = @{ last_run_at = ''; ignored_hash = '' }
             }
-            if ($evt.action -eq 'fix_config') {
+            if ($action -eq 'fix_config') {
                 try {
                     $findings = Test-AnsysConfig
                     if ($null -eq $findings) { $findings = @() }
@@ -131,8 +170,13 @@ function Step-Agent {
                         $batPath = Join-Path $scriptRoot 'fix-ansys-config.bat'
                         [void](New-AnsysConfigFixBat -Findings $findings -OutPath $batPath)
                         Write-AgentLog "Generated $batPath with $($findings.Count) fix(es)"
+                        # The bat self-deletes after running successfully. If the
+                        # launch itself failed (UAC declined, elevation blocked),
+                        # remove the artifact now so it doesn't sit on disk.
                         if (Invoke-AnsysConfigFixLaunch -BatPath $batPath) {
                             Show-ConfigFixLaunchedToast
+                        } else {
+                            Remove-Item -LiteralPath $batPath -Force -ErrorAction SilentlyContinue
                         }
                     }
                 } catch {
@@ -152,11 +196,11 @@ function Step-Agent {
         }
 
         if (-not $State.sessions.ContainsKey($key)) {
-            Write-AgentLog "Click '$($evt.action)' for unknown session $key, ignoring" -Level DEBUG
+            Write-AgentLog "Click '$action' for unknown session $key, ignoring" -Level DEBUG
             continue
         }
         $session = $State.sessions[$key]
-        switch ($evt.action) {
+        switch ($action) {
             'got_it' {
                 Write-AgentLog "Got-it clicked for $key"
             }
@@ -178,9 +222,16 @@ function Step-Agent {
                 Write-AgentLog "Snoozed (body click) for $key, next prompt at $($session.next_prompt_at)"
             }
             default {
-                Write-AgentLog "Unknown click action '$($evt.action)' for $key" -Level WARN
+                Write-AgentLog "Unknown click action '$action' for $key" -Level WARN
             }
         }
+    }
+
+    # Persist queue effects immediately. If Step-Agent throws later in this
+    # iteration, the user's click (suppress, ignore_config, ...) is already
+    # durable -- so they don't have to click again on the next loop.
+    if ($clicks.Count -gt 0) {
+        Save-State -State $State
     }
 
     # 2. Discover currently-active sessions.
@@ -280,6 +331,24 @@ function Step-Agent {
 # Main loop.
 $state = Load-State
 Write-AgentLog ("Loaded {0} session(s) from prior run" -f $state.sessions.Count)
+
+# Startup self-test. Catches "agent is running but missing a prerequisite"
+# (e.g. no ANSYS install detected on a workstation where compliance is
+# configured) so the user knows about it before they spend an hour
+# wondering why nothing toasts.
+try {
+    $selfTestFindings = Invoke-AgentSelfTest
+    if ($selfTestFindings -and $selfTestFindings.Count -gt 0) {
+        foreach ($f in $selfTestFindings) {
+            Write-AgentLog "Self-test: $($f.key) - $($f.message)" -Level WARN
+        }
+        Show-AgentSelfTestToast -Findings $selfTestFindings
+    } else {
+        Write-AgentLog "Self-test: all checks passed" -Level DEBUG
+    }
+} catch {
+    Write-AgentLog "Self-test threw: $_" -Level ERROR
+}
 
 # One-shot compliance check at startup. Toasts only if there are findings the
 # user hasn't already dismissed via "Ignore".

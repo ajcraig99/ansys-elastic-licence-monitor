@@ -8,16 +8,25 @@ A Windows workstation agent that detects ANSYS **elastic** licence checkouts in 
 
 The repo contains only the workstation agent (PowerShell + BurntToast). There is no central API, server-side aggregator, or messaging integration in scope here.
 
-Read `docs/ARCHITECTURE.md` before doing anything non-trivial. Its "Dead ends" section lists approaches that were investigated and ruled out (no portal API, `ansysli_util` deprecated, launcher-wrapper approach rejected, etc.) — do not re-investigate them.
+Read `docs/ARCHITECTURE.md` before doing anything non-trivial. Its "Dead ends" section lists approaches that were investigated and ruled out (no portal API, `ansysli_util` deprecated, launcher-wrapper approach rejected, etc.) — do not re-investigate them. `README.md` is the user-facing pitch (install, config, troubleshooting) — useful when a change affects what an end-user sees.
 
 ## Commands
 
 ```powershell
-# Run parser self-test against the bundled sample log (expects 4 elastic events)
+# Run all offline tests (syntax + parser + configcheck). Add -IncludePerpetual
+# to also hit the live licence server.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-all.ps1
+
+# Individual tests:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-parser.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-configcheck.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test-perpetual.ps1
+
+# Show status (version, discovered ANSYS install, task state) and exit
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent.ps1 -Status
 
 # Syntax-check every .ps1 without executing it
-$files = @('agent.ps1','common.ps1','install.ps1','uninstall.ps1','test-parser.ps1','test-perpetual.ps1','toast-callback.ps1')
+$files = @('agent.ps1','common.ps1','install.ps1','uninstall.ps1','test-parser.ps1','test-perpetual.ps1','test-configcheck.ps1','toast-callback.ps1')
 foreach ($f in $files) {
     $errs = $null; $tokens = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errs)
@@ -35,9 +44,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent.ps1 -PollInterva
 
 # Watch live agent log when installed
 Get-Content "$env:LOCALAPPDATA\AnsysElasticLicenceMonitor\agent.log" -Tail 50 -Wait
+
+# Build the Inno Setup installer (output: dist\AnsysElasticLicenceMonitor-Setup.exe)
+# Public build:
+ISCC.exe installer.iss
+# Internal build with a baked-in default central-config source (value not committed):
+ISCC.exe /DDefaultConfigSource="\\fileserver\share\config.json" installer.iss
 ```
 
-There is no test framework — `test-parser.ps1` is the only test and only covers the regex against `sample-acl-log.log`. If you change `Find-ElasticCheckouts` or `$ElasticCheckoutPattern` in `common.ps1`, run it.
+There is no test framework. The runnable tests are:
+- `test-all.ps1` — aggregator: syntax-checks every `.ps1`, then runs the offline tests in fresh PowerShell sessions. The primary entry point during dev.
+- `test-parser.ps1` — regex coverage against `sample-acl-log.log`. Run after any change to `Find-ElasticCheckouts` or `$ElasticCheckoutPattern` in `common.ps1`.
+- `test-configcheck.ps1` — fixture-based assertions for `Test-AnsysConfig`, `Get-AnsysConfigFindingsHash`, and `New-AnsysConfigFixBat`. No ANSYS install needed; runs anywhere PowerShell does.
+- `test-perpetual.ps1` — calls `lmutil lmstat` against the configured licence server. Skip in dev environments that can't reach it.
 
 ## Architecture
 
@@ -57,7 +76,13 @@ The agent is one long-running PowerShell loop launched at logon by a per-user sc
 
 **Session state machine:** `NEW` → (first elastic match) → `NOTIFIED` → (button: `suppress`) → `SUPPRESSED`. `accept` and `snooze` (body-click on escalation toast) only push `next_prompt_at` forward; they do not change state. State persists across agent restarts via `state.json`.
 
-**Configuration model.** Two-tier load in `Import-AppConfig` (called at dot-source time): (1) bundled `config.json` next to `common.ps1`, (2) optional central config from a URL or path read from `config-source.txt`. Tier 2 layers over tier 1 — any field present centrally wins. If tier 2 is absent or unreachable, the agent logs WARN and uses tier 1. Detection works regardless of either; only the perpetual-context enrichment in toast 1 needs `licenseServer.host`/`port` and `perpetualFeatures` set. The installer wizard prompts for the central source; pass `/DDefaultConfigSource="..."` to ISCC to pre-fill that prompt for an internal build (the value bakes into the .exe but is not in source).
+**Compliance check (second job).** Alongside elastic detection, the agent runs `Invoke-ConfigCheckCycle` once per loop iteration (gated by `configCheck.intervalMinutes`, default 60) to verify the workstation's static ANSYS configuration matches what site policy expects. `Test-AnsysConfig` produces a list of findings by comparing three sources against `$script:ExpectedConfig` (populated from `config.json`'s `configCheck` block): (1) the `SERVER=` line in `%TEMP%\..\Ansys Inc\Shared Files\Licensing\ansyslmd.ini`, (2) forbidden HKCU `Environment` variables (e.g. `ANSYSLI_SERVERS`, `ANSYSLMD_LICENSE_FILE`), (3) the active product in each `%APPDATA%\Ansys\v<NNN>\MechanicalLicenseOptions.xml`. Findings are hashed (`Get-AnsysConfigFindingsHash`) and compared against `state.json`'s `configCheckIgnoredHash` so the user can dismiss a specific set of findings and not get re-prompted until something changes. On a non-empty, non-ignored result, `Show-ConfigMismatchToast` fires with a "Fix it" button → `ansyselastic:configfix` → `Invoke-AnsysConfigFixLaunch` writes a base64-encoded `.bat` (via `New-AnsysConfigFixBat`) and prompts the user with UAC. The `.bat` uses `-EncodedCommand` to avoid quoting hell when editing XML/INI from a batch context. The compliance toast and `configfix` action share the same protocol pipeline as elastic toasts — if you add new URL actions, route them through `toast-callback.ps1` the same way.
+
+**Configuration model.** Two-tier load in `Import-AppConfig` (called at dot-source time): (1) bundled `config.json` next to `common.ps1`, (2) optional central config from a *local filesystem path* (incl. UNC/mapped drive) read from `config-source.txt`. HTTPS was removed — it confused non-technical users in the wizard and added a MITM surface for no gain. Tier 2 layers over tier 1 — any field present centrally wins. If tier 2 is absent, unreachable, malformed, or over 1 MB the agent logs WARN and uses tier 1. Detection works regardless of either; only the perpetual-context enrichment in toast 1 needs `licenseServer.host`/`port` and `perpetualFeatures` set. The installer wizard prompts for the central source; pass `/DDefaultConfigSource="..."` to ISCC to pre-fill that prompt for an internal build (the value bakes into the .exe but is not in source).
+
+**Future-proofing.** Discovery of ANSYS-internals lives in two helpers: `Get-AnsysVersionDirs` (numeric-sorted enumeration of `v*` directories — so `v100` outranks `v99` once that day arrives), and `Get-AnsysEnvironment` (single hashtable of every discovered path: install root, lmutil, ansyslmd.ini, version dirs, lmutil chosen across all versions until one works). Everything version-coupled flows through one of those. The detection couplings (`ansyscl.exe` process name, ACL log directory, ansyslmd.ini path, install root list) are also overridable in `config.json` so a future ANSYS rename/relocate is a config edit, not a code release.
+
+**Code conventions.** `common.ps1` and `agent.ps1` set `Set-StrictMode -Version 3.0`. Forced array semantics (`@(...)`) are used at every site that takes `.Count` or indexes into a function result, because PowerShell auto-unwraps single-element pipelines under strict mode otherwise. Don't drop the wrap when refactoring.
 
 **Install model.** The scheduled task runs `powershell.exe -File "$InstallDir\agent.ps1"` at user logon under `LogonType Interactive, RunLevel Limited` — toasts only render in an interactive desktop session, so SYSTEM/highest-privilege would silently fail to notify. `ExecutionTimeLimit` is `[TimeSpan]::Zero` (no limit) because this is a long-running poll loop, not a batch job.
 

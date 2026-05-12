@@ -39,6 +39,14 @@ if ($samePath) {
         Write-Host "  Copied $f"
     }
 
+    # VERSION file ships next to the scripts so Get-AgentVersion has something
+    # to read post-install. Absent in dev runs that haven't tagged a version.
+    $verSrc = Join-Path $sourceDir 'VERSION'
+    if (Test-Path $verSrc) {
+        Copy-Item -Path $verSrc -Destination $InstallDir -Force
+        Write-Host "  Copied VERSION"
+    }
+
     # config.json is copied only if absent so admin/user edits survive an
     # in-place re-install. To force a config reset, delete the file first or
     # uninstall (which wipes the dir) before re-running install.
@@ -56,9 +64,13 @@ if ($samePath) {
     }
 }
 
-# 3. Install BurntToast if absent.
-if (-not (Get-Module -ListAvailable -Name BurntToast)) {
-    Write-Host "  Installing BurntToast PowerShell module (CurrentUser scope)..."
+# 3. Install BurntToast if absent. Pinned to a known-good version so a future
+#    breaking release from the upstream module doesn't silently break the agent.
+#    Bump when validating a newer release.
+$BurntToastMinVersion = '0.8.5'
+$existing = Get-Module -ListAvailable -Name BurntToast | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $existing -or $existing.Version -lt [version]$BurntToastMinVersion) {
+    Write-Host "  Installing BurntToast PowerShell module $BurntToastMinVersion+ (CurrentUser scope)..."
     if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
         Install-PackageProvider -Name NuGet -Scope CurrentUser -Force -ForceBootstrap | Out-Null
     }
@@ -66,9 +78,9 @@ if (-not (Get-Module -ListAvailable -Name BurntToast)) {
     if ($gallery -and $gallery.InstallationPolicy -ne 'Trusted') {
         Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
     }
-    Install-Module -Name BurntToast -Scope CurrentUser -Force -AllowClobber
+    Install-Module -Name BurntToast -MinimumVersion $BurntToastMinVersion -Scope CurrentUser -Force
 } else {
-    Write-Host "  BurntToast already installed"
+    Write-Host "  BurntToast already installed (v$($existing.Version))"
 }
 
 # 4. Register scheduled task: At Logon, current user, hidden window.

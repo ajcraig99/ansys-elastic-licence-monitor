@@ -27,11 +27,17 @@
   #define DefaultConfigSource ""
 #endif
 
+; Single source of truth for the agent version: VERSION file at repo root.
+; Read once at compile time; agent.ps1 / Get-AgentVersion reads it at runtime.
+#define VersionFileHandle FileOpen("VERSION")
+#define AppVer Trim(FileRead(VersionFileHandle))
+#expr FileClose(VersionFileHandle)
+
 [Setup]
 ; AppId is fixed forever -- changing it breaks upgrade detection on installed machines.
 AppId={{FD570A3F-0D93-4A09-BACD-F5F99D919EBB}
 AppName=Ansys Elastic Licence Monitor
-AppVersion=1.0.0
+AppVersion={#AppVer}
 AppPublisher=Arron Craig
 AppPublisherURL=
 AppSupportURL=
@@ -63,6 +69,7 @@ Source: "uninstall.ps1";      DestDir: "{app}"; Flags: ignoreversion
 Source: "toast-callback.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "toast-callback.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE";            DestDir: "{app}"; Flags: ignoreversion
+Source: "VERSION";            DestDir: "{app}"; Flags: ignoreversion
 ; config.json: onlyifdoesntexist preserves admin/user edits across upgrades.
 ; A reinstall over the top will NOT clobber a customised config. To force
 ; replacement, uninstall first (which wipes {app}) then re-run setup.
@@ -70,11 +77,10 @@ Source: "config.json";        DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Messages]
 ; Override the default "Setup has finished installing X. Click Finish." with
-; something that confirms the agent is actually running and tells the user
-; where to look. Heading is the big text at the top of the finish page;
-; FinishedLabel is the body text below it.
+; something that explains what to do, not just that it ran. The headline is
+; the big text at the top of the finish page; FinishedLabel is the body.
 FinishedHeadingLabel=Ansys Elastic Licence Monitor is running
-FinishedLabel=The agent is now watching for ANSYS elastic licence checkouts. The next time you launch Workbench, Mechanical, or Discovery and a paid elastic feature is checked out, a Windows toast notification will appear.%n%nLogs: %localappdata%\AnsysElasticLicenceMonitor\agent.log%nConfig: %localappdata%\AnsysElasticLicenceMonitor\config.json%nUninstall: Settings -> Apps -> Ansys Elastic Licence Monitor
+FinishedLabel=When a paid ANSYS elastic licence is checked out, a Windows toast notification will appear.%n%nWhat to do when you see it:%n  - Close ANSYS to switch back to the perpetual (free) licence, OR%n  - Click "Keep billing me" to continue and accept the cost.%n%nEach hour of elastic use costs money. Closing ANSYS and reopening it is the free option.%n%nLogs: %localappdata%\AnsysElasticLicenceMonitor\agent.log%nUninstall: Settings -> Apps -> Ansys Elastic Licence Monitor
 
 [Run]
 ; install.ps1 detects that source-dir == install-dir and skips its own copy
@@ -106,14 +112,8 @@ var
 procedure BrowseButtonClick(Sender: TObject);
 var
   Path: string;
-  Lower: string;
 begin
   Path := Trim(ConfigSourcePage.Values[0]);
-  // Don't pre-populate the dialog if the current value is a URL --
-  // the file picker can't navigate there and would just confuse Windows.
-  Lower := LowerCase(Path);
-  if (Pos('http://', Lower) = 1) or (Pos('https://', Lower) = 1) then
-    Path := '';
   if GetOpenFileName(
        'Select central config file',
        Path,
@@ -129,26 +129,28 @@ var
   ButtonWidth: Integer;
   Gap: Integer;
 begin
+  // Local file only. HTTPS support was removed because the wizard prompt
+  // confused non-technical users and the http:// fallback added a MITM
+  // surface for no real benefit -- a network drive or UNC path works for
+  // every fleet deployment.
   ConfigSourcePage := CreateInputQueryPage(
     wpSelectTasks,
     'Central configuration source',
-    'Where should the agent fetch its site-specific configuration from?',
-    'Optional. Enter a URL or path to a JSON file containing site-specific overrides ' +
-    '(licence server, perpetual feature list, display names). The agent reads this ' +
-    'once at startup, falling back to the bundled defaults on failure.' + #13#10 + #13#10 +
-    'Supported formats:' + #13#10 +
-    '  - HTTPS URL:    https://example.com/config.json' + #13#10 +
-    '  - Mapped drive: Z:\share\config.json' + #13#10 +
-    '  - UNC path:     \\fileserver\share\config.json' + #13#10 +
-    '  - Local file:   C:\path\config.json' + #13#10 + #13#10 +
-    'Click Browse to pick a file; for a URL, just type or paste it. Leave blank ' +
-    'to use bundled defaults only.');
-  ConfigSourcePage.Add('Config source (optional):', False);
+    'Optional. Pick a shared config file your IT team gave you.',
+    'If your IT team has provided a shared config file, click Browse to pick it. ' +
+    'This lets them update everyone''s licence-server settings from one place.' + #13#10 + #13#10 +
+    'If you weren''t given anything, just click Next -- the agent works fine without it. ' +
+    'You won''t see the "perpetual is held by [user]" enrichment in the toast, but ' +
+    'detection itself is unaffected.' + #13#10 + #13#10 +
+    'Examples of valid locations:' + #13#10 +
+    '  - Network drive: Z:\share\config.json' + #13#10 +
+    '  - UNC path:      \\fileserver\share\config.json' + #13#10 +
+    '  - Local file:    C:\path\config.json');
+  ConfigSourcePage.Add('Config file (optional):', False);
   ConfigSourcePage.Values[0] := '{#DefaultConfigSource}';
 
-  // Add a Browse button to the right of the edit. The text field still works
-  // for URLs (which a file picker can't navigate), so the button is a
-  // convenience for the local/UNC/mapped-drive case, not the only path in.
+  // Browse button. The text field still accepts UNC/mapped paths directly,
+  // but Browse is the path of least resistance for the typical user.
   ButtonWidth := ScaleX(75);
   Gap := ScaleX(8);
   EditWidth := ConfigSourcePage.Edits[0].Width - ButtonWidth - Gap;
@@ -163,6 +165,30 @@ begin
   BrowseButton.OnClick := @BrowseButtonClick;
 
   ConfigSourcePage.Edits[0].Width := EditWidth;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  ConfigSource, Lower: string;
+begin
+  Result := True;
+  if CurPageID = ConfigSourcePage.ID then
+  begin
+    ConfigSource := Trim(ConfigSourcePage.Values[0]);
+    if ConfigSource = '' then Exit;
+    // Reject HTTP(S) URLs -- they used to be accepted, but the agent no
+    // longer supports them. Catch it here rather than silently failing at
+    // first run.
+    Lower := LowerCase(ConfigSource);
+    if (Pos('http://', Lower) = 1) or (Pos('https://', Lower) = 1) then
+    begin
+      MsgBox('HTTP and HTTPS URLs are no longer supported. ' +
+             'Please pick a local file, network drive, or UNC path.' + #13#10 + #13#10 +
+             'If you''re not sure what to do, leave the field blank and click Next.',
+             mbError, MB_OK);
+      Result := False;
+    end;
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
