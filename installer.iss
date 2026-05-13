@@ -86,10 +86,13 @@ FinishedLabel=When a paid ANSYS elastic licence is checked out, a Windows toast 
 ; install.ps1 detects that source-dir == install-dir and skips its own copy
 ; step, then proceeds to install BurntToast, register the scheduled task,
 ; register the ansyselastic: protocol, and start the agent.
+;
+; install.ps1 enforces its own hard timeout on the BurntToast/PSGallery step
+; so this waituntilterminated cannot deadlock the wizard on a slow network.
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"""; \
   Flags: runhidden waituntilterminated; \
-  StatusMsg: "Registering scheduled task and starting agent..."
+  StatusMsg: "Installing BurntToast module, registering scheduled task, and starting agent (up to ~3 minutes on first install)..."
 
 [UninstallRun]
 ; uninstall.ps1 -SkipDirRemoval kills the agent, unregisters the task and

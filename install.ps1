@@ -7,9 +7,25 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# WinPS 5.1 defaults SecurityProtocol to TLS 1.0/1.1. PSGallery dropped both
+# in 2020, so without this every PSGallery contact (Install-PackageProvider,
+# Install-Module) sits in a long internal retry loop and the hidden installer
+# window appears to hang. Set once, up front.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {}
+
 $TaskName    = 'Ansys Elastic Licence Monitor'
 $InstallDir  = Join-Path $env:LOCALAPPDATA 'AnsysElasticLicenceMonitor'
 $sourceDir   = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+
+# Hard ceiling on the BurntToast install step. Without this, a slow network,
+# blocked proxy, or hidden PSGallery prompt can hang the Inno wizard forever
+# (the [Run] step uses waituntilterminated). On timeout we fall through; the
+# agent's startup self-test will toast the user about the missing module.
+$burntToastInstallTimeoutSec = [int]($env:AELM_BURNTTOAST_INSTALL_TIMEOUT_SEC)
+if ($burntToastInstallTimeoutSec -le 0) { $burntToastInstallTimeoutSec = 180 }
 
 Write-Host "Installing Ansys Elastic Licence Monitor..."
 Write-Host "  Install directory: $InstallDir"
@@ -67,18 +83,50 @@ if ($samePath) {
 # 3. Install BurntToast if absent. Pinned to a known-good version so a future
 #    breaking release from the upstream module doesn't silently break the agent.
 #    Bump when validating a newer release.
+#
+#    The actual install runs in a background job with a hard timeout because
+#    Install-PackageProvider and Install-Module have NO native timeout and
+#    can hang for minutes on slow networks, corporate proxies, or invisible
+#    prompts (the Inno [Run] step uses runhidden waituntilterminated, so any
+#    interactive prompt sits forever waiting for input that can't arrive).
 $BurntToastMinVersion = '0.8.5'
 $existing = Get-Module -ListAvailable -Name BurntToast | Sort-Object Version -Descending | Select-Object -First 1
 if (-not $existing -or $existing.Version -lt [version]$BurntToastMinVersion) {
-    Write-Host "  Installing BurntToast PowerShell module $BurntToastMinVersion+ (CurrentUser scope)..."
-    if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-        Install-PackageProvider -Name NuGet -Scope CurrentUser -Force -ForceBootstrap | Out-Null
+    Write-Host "  Installing BurntToast PowerShell module $BurntToastMinVersion+ (CurrentUser scope, up to ${burntToastInstallTimeoutSec}s)..."
+    $job = Start-Job -ScriptBlock {
+        param($MinVersion)
+        $ErrorActionPreference = 'Stop'
+        # Re-apply TLS 1.2 inside the job (separate runspace, fresh defaults).
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = `
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        } catch {}
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -Scope CurrentUser -Force -ForceBootstrap | Out-Null
+        }
+        # Trust PSGallery unconditionally and best-effort. The previous gated
+        # version skipped this entirely if Get-PSRepository returned nothing,
+        # which left Install-Module to emit a hidden "untrusted repo" prompt.
+        try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch {}
+        Install-Module -Name BurntToast -MinimumVersion $MinVersion -Scope CurrentUser -Force -AllowClobber -Confirm:$false
+    } -ArgumentList $BurntToastMinVersion
+
+    $completed = Wait-Job -Job $job -Timeout $burntToastInstallTimeoutSec
+    if (-not $completed) {
+        Write-Host "  WARN: BurntToast install did not finish within ${burntToastInstallTimeoutSec}s; continuing without it."
+        Write-Host "        The agent will detect the missing module on startup and toast the user."
+        Write-Host "        To install manually later, run:  Install-Module BurntToast -Scope CurrentUser"
+        try { Stop-Job -Job $job -ErrorAction SilentlyContinue } catch {}
+    } else {
+        try {
+            $jobOutput = Receive-Job -Job $job -ErrorAction Stop
+            Write-Host "  BurntToast install completed"
+        } catch {
+            Write-Host "  WARN: BurntToast install failed: $_"
+            Write-Host "        The agent will detect the missing module on startup and toast the user."
+        }
     }
-    $gallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
-    if ($gallery -and $gallery.InstallationPolicy -ne 'Trusted') {
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-    }
-    Install-Module -Name BurntToast -MinimumVersion $BurntToastMinVersion -Scope CurrentUser -Force
+    try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
 } else {
     Write-Host "  BurntToast already installed (v$($existing.Version))"
 }
