@@ -17,6 +17,11 @@ $script:LogFilePath    = Join-Path $script:AppDataDir 'agent.log'
 $script:StateFilePath  = Join-Path $script:AppDataDir 'state.json'
 $script:QueueFilePath  = Join-Path $script:AppDataDir 'toast-queue.jsonl'
 
+# Cache of the last state JSON written to disk. Save-State compares against this
+# and skips the write + atomic rename when nothing changed (steady state at a 10s
+# poll is identical iteration-to-iteration), removing most state.json churn.
+$script:LastSavedStateJson = $null
+
 # Two-tier config:
 #   Tier 1: bundled config.json next to common.ps1 (always present, defaults).
 #   Tier 2: central config -- a *local-or-UNC path* read from config-source.txt.
@@ -35,6 +40,14 @@ $script:VersionFilePath       = Join-Path $script:CommonScriptDir 'VERSION'
 # Hard limit on central-config file size. A malicious or accidentally-massive
 # JSON would otherwise let ConvertFrom-Json balloon memory.
 $script:ConfigSizeLimitBytes = 1MB
+
+# Debug-build state. DebugModeEnabled is flipped by config.json (debug.enabled)
+# and gates the extra triage affordances: View-triggers / Open-full-log toast
+# buttons, raw-line + near-miss logging, and the recent_elastic_lines ring.
+# Released builds leave this false and stay silent.
+$script:DebugModeEnabled       = $false
+$script:DebugRecentLinesCap    = 10
+$script:ManualTriggerFlagPath  = Join-Path $script:AppDataDir 'trigger-check.flag'
 
 # Defaults are intentionally empty: detection works without any site config
 # (the (elastic) tag in the ACL log is universal), but the perpetual-context
@@ -178,68 +191,131 @@ function Merge-AppConfigJson {
 
     $cfgProps = $cfg.PSObject.Properties.Name
     $changed = $false
-    if ($cfgProps -contains 'licenseServer' -and $cfg.licenseServer) {
-        $lsProps = $cfg.licenseServer.PSObject.Properties.Name
-        if ($lsProps -contains 'host' -and $cfg.licenseServer.host) {
-            $script:LicServerHost = [string]$cfg.licenseServer.host; $changed = $true
-        }
-        if ($lsProps -contains 'port' -and $cfg.licenseServer.port) {
-            $script:LicServerPort = [int]$cfg.licenseServer.port;   $changed = $true
-        }
+
+    # Snapshot every overridable var before touching any of them. A terminating
+    # error partway through (an unforeseen bad cast, say) would otherwise leave a
+    # half-applied, blended config -- host set but port defaulted, everything past
+    # the failing field skipped. On any throw we restore the pre-merge values and
+    # rethrow, so the caller logs WARN and keeps whatever the prior tier loaded.
+    $snapshot = @{
+        LicServerHost          = $script:LicServerHost
+        LicServerPort          = $script:LicServerPort
+        PerpetualFeatures      = $script:PerpetualFeatures
+        FeatureDisplayNames    = $script:FeatureDisplayNames
+        DetectionProcessName   = $script:DetectionProcessName
+        AclLogDir              = $script:AclLogDir
+        DebugModeEnabled       = $script:DebugModeEnabled
+        AnsyslmdServer         = $script:ExpectedConfig.AnsyslmdServer
+        AnsyslmdIniPath        = $script:AnsyslmdIniPath
+        AnsysIncRootDefaults   = $script:AnsysIncRootDefaults
+        ForbiddenUserEnvVars   = $script:ExpectedConfig.ForbiddenUserEnvVars
+        RequiredLicenseOptions = $script:ExpectedConfig.RequiredLicenseOptions
     }
-    if ($cfgProps -contains 'perpetualFeatures' -and $cfg.perpetualFeatures) {
-        $script:PerpetualFeatures = @($cfg.perpetualFeatures | ForEach-Object { [string]$_ })
-        $changed = $true
-    }
-    if ($cfgProps -contains 'featureDisplayNames' -and $cfg.featureDisplayNames) {
-        $h = @{}
-        foreach ($p in $cfg.featureDisplayNames.PSObject.Properties) {
-            $h[$p.Name] = [string]$p.Value
+    try {
+        if ($cfgProps -contains 'licenseServer' -and $cfg.licenseServer) {
+            $lsProps = $cfg.licenseServer.PSObject.Properties.Name
+            if ($lsProps -contains 'host' -and $cfg.licenseServer.host) {
+                $script:LicServerHost = [string]$cfg.licenseServer.host; $changed = $true
+            }
+            if ($lsProps -contains 'port' -and $cfg.licenseServer.port) {
+                # Non-throwing coercion: a cast like [int]'1055x' is a *terminating*
+                # error regardless of $ErrorActionPreference, which (pre-fix) killed
+                # the agent at dot-source time on a single bad central-config typo --
+                # fleet-wide, since the central config is shared.
+                $p = 0
+                if ([int]::TryParse([string]$cfg.licenseServer.port, [ref]$p)) {
+                    $script:LicServerPort = $p; $changed = $true
+                } else {
+                    Write-AgentLog "Ignoring non-numeric licenseServer.port '$($cfg.licenseServer.port)'" -Level WARN
+                }
+            }
         }
-        $script:FeatureDisplayNames = $h
-        $changed = $true
-    }
-    # Detection coupling: deliberately overridable so an Ansys release that
-    # renames the process or relocates the log dir is a config edit, not a
-    # code release.
-    if ($cfgProps -contains 'detection' -and $cfg.detection) {
-        $dProps = $cfg.detection.PSObject.Properties.Name
-        if ($dProps -contains 'processName' -and $cfg.detection.processName) {
-            $script:DetectionProcessName = [string]$cfg.detection.processName; $changed = $true
-        }
-        if ($dProps -contains 'aclLogDir' -and $cfg.detection.aclLogDir) {
-            $script:AclLogDir = [string]$cfg.detection.aclLogDir; $changed = $true
-        }
-    }
-    if ($cfgProps -contains 'expectedConfig' -and $cfg.expectedConfig) {
-        $ec = $cfg.expectedConfig
-        $ecProps = $ec.PSObject.Properties.Name
-        if ($ecProps -contains 'ansyslmdServer' -and $ec.ansyslmdServer) {
-            $script:ExpectedConfig.AnsyslmdServer = [string]$ec.ansyslmdServer
+        if ($cfgProps -contains 'perpetualFeatures' -and $cfg.perpetualFeatures) {
+            $script:PerpetualFeatures = @($cfg.perpetualFeatures | ForEach-Object { [string]$_ })
             $changed = $true
         }
-        if ($ecProps -contains 'ansyslmdIniPath' -and $ec.ansyslmdIniPath) {
-            $script:AnsyslmdIniPath = [string]$ec.ansyslmdIniPath
-            $changed = $true
-        }
-        if ($ecProps -contains 'ansysIncRoots' -and $ec.ansysIncRoots) {
-            $script:AnsysIncRootDefaults = @($ec.ansysIncRoots | ForEach-Object { [string]$_ })
-            $changed = $true
-        }
-        if ($ecProps -contains 'forbiddenUserEnvVars' -and $ec.forbiddenUserEnvVars) {
-            $script:ExpectedConfig.ForbiddenUserEnvVars = @($ec.forbiddenUserEnvVars | ForEach-Object { [string]$_ })
-            $changed = $true
-        }
-        if ($ecProps -contains 'requiredLicenseOptions' -and $ec.requiredLicenseOptions) {
+        if ($cfgProps -contains 'featureDisplayNames' -and $cfg.featureDisplayNames) {
             $h = @{}
-            foreach ($p in $ec.requiredLicenseOptions.PSObject.Properties) {
+            foreach ($p in $cfg.featureDisplayNames.PSObject.Properties) {
                 $h[$p.Name] = [string]$p.Value
             }
-            $script:ExpectedConfig.RequiredLicenseOptions = $h
+            $script:FeatureDisplayNames = $h
             $changed = $true
         }
+        # Detection coupling: deliberately overridable so an Ansys release that
+        # renames the process or relocates the log dir is a config edit, not a
+        # code release.
+        if ($cfgProps -contains 'detection' -and $cfg.detection) {
+            $dProps = $cfg.detection.PSObject.Properties.Name
+            if ($dProps -contains 'processName' -and $cfg.detection.processName) {
+                $script:DetectionProcessName = [string]$cfg.detection.processName; $changed = $true
+            }
+            if ($dProps -contains 'aclLogDir' -and $cfg.detection.aclLogDir) {
+                $script:AclLogDir = [string]$cfg.detection.aclLogDir; $changed = $true
+            }
+        }
+        if ($cfgProps -contains 'debug' -and $cfg.debug) {
+            $dbgProps = $cfg.debug.PSObject.Properties.Name
+            if ($dbgProps -contains 'enabled') {
+                # [bool] on a string is $true for ANY non-empty string -- so a
+                # quoted "false" in JSON would silently enable debug. Compare the
+                # text explicitly; only a real boolean or the literal "true"
+                # (case-insensitive) turns debug on.
+                $dbgVal = $cfg.debug.enabled
+                if ($dbgVal -is [bool]) {
+                    $script:DebugModeEnabled = $dbgVal
+                } else {
+                    $script:DebugModeEnabled = (([string]$dbgVal).Trim() -eq 'true')
+                }
+                $changed = $true
+            }
+        }
+        if ($cfgProps -contains 'expectedConfig' -and $cfg.expectedConfig) {
+            $ec = $cfg.expectedConfig
+            $ecProps = $ec.PSObject.Properties.Name
+            if ($ecProps -contains 'ansyslmdServer' -and $ec.ansyslmdServer) {
+                $script:ExpectedConfig.AnsyslmdServer = [string]$ec.ansyslmdServer
+                $changed = $true
+            }
+            if ($ecProps -contains 'ansyslmdIniPath' -and $ec.ansyslmdIniPath) {
+                $script:AnsyslmdIniPath = [string]$ec.ansyslmdIniPath
+                $changed = $true
+            }
+            if ($ecProps -contains 'ansysIncRoots' -and $ec.ansysIncRoots) {
+                $script:AnsysIncRootDefaults = @($ec.ansysIncRoots | ForEach-Object { [string]$_ })
+                $changed = $true
+            }
+            if ($ecProps -contains 'forbiddenUserEnvVars' -and $ec.forbiddenUserEnvVars) {
+                $script:ExpectedConfig.ForbiddenUserEnvVars = @($ec.forbiddenUserEnvVars | ForEach-Object { [string]$_ })
+                $changed = $true
+            }
+            if ($ecProps -contains 'requiredLicenseOptions' -and $ec.requiredLicenseOptions) {
+                $h = @{}
+                foreach ($p in $ec.requiredLicenseOptions.PSObject.Properties) {
+                    $h[$p.Name] = [string]$p.Value
+                }
+                $script:ExpectedConfig.RequiredLicenseOptions = $h
+                $changed = $true
+            }
+        }
+        return $changed
+    } catch {
+        # Roll back to the pre-merge snapshot so a partial failure can't leave a
+        # blended config, then rethrow for the caller to log + fall back.
+        $script:LicServerHost                         = $snapshot.LicServerHost
+        $script:LicServerPort                         = $snapshot.LicServerPort
+        $script:PerpetualFeatures                     = $snapshot.PerpetualFeatures
+        $script:FeatureDisplayNames                   = $snapshot.FeatureDisplayNames
+        $script:DetectionProcessName                  = $snapshot.DetectionProcessName
+        $script:AclLogDir                             = $snapshot.AclLogDir
+        $script:DebugModeEnabled                      = $snapshot.DebugModeEnabled
+        $script:ExpectedConfig.AnsyslmdServer         = $snapshot.AnsyslmdServer
+        $script:AnsyslmdIniPath                       = $snapshot.AnsyslmdIniPath
+        $script:AnsysIncRootDefaults                  = $snapshot.AnsysIncRootDefaults
+        $script:ExpectedConfig.ForbiddenUserEnvVars   = $snapshot.ForbiddenUserEnvVars
+        $script:ExpectedConfig.RequiredLicenseOptions = $snapshot.RequiredLicenseOptions
+        throw
     }
-    return $changed
 }
 
 function Import-AppConfig {
@@ -262,11 +338,17 @@ function Import-AppConfig {
     $tier2Json = Get-CentralConfigText
     $tier2Loaded = $false
     if ($null -ne $tier2Json) {
-        $tier2Loaded = Merge-AppConfigJson -Json $tier2Json
+        # Guard like tier 1: a malformed central config (fleet-managed, shared)
+        # must never take the agent down -- it logs WARN and falls back to tier 1.
+        try {
+            $tier2Loaded = Merge-AppConfigJson -Json $tier2Json
+        } catch {
+            Write-AgentLog "Central config merge failed: $_. Using tier 1." -Level WARN
+        }
     }
 
-    Write-AgentLog ("Config load: tier1(config.json)={0} tier2(central)={1} server={2}:{3} perpetualFeatures={4}" -f `
-        $tier1Loaded, $tier2Loaded, $script:LicServerHost, $script:LicServerPort, ($script:PerpetualFeatures -join ',')) -Level DEBUG
+    Write-AgentLog ("Config load: tier1(config.json)={0} tier2(central)={1} server={2}:{3} perpetualFeatures={4} debug={5}" -f `
+        $tier1Loaded, $tier2Loaded, $script:LicServerHost, $script:LicServerPort, ($script:PerpetualFeatures -join ','), $script:DebugModeEnabled) -Level DEBUG
 }
 
 function Get-ActiveAnsysclSessions {
@@ -453,10 +535,99 @@ function Find-ElasticCheckouts {
                 Feature     = $Matches['feature']
                 User        = $Matches['user']
                 ElasticHost = $Matches['host']
+                # RawLine is the matched line verbatim. The debug build surfaces
+                # this in the View-triggers evidence file so testers can confirm
+                # the regex bit on something ANSYS actually wrote, not noise.
+                RawLine     = $line
             }
         }
     }
     return $results
+}
+
+function Write-DebugEvidenceFile {
+    # Writes a human-readable triage file for the "View triggers" debug button.
+    # Uses the per-session recent_elastic_lines ring populated by Step-Agent;
+    # if the ring is empty (old session, agent restart) falls back to a tail
+    # re-scan of the live ACL log. Returns the absolute path of the file.
+    param(
+        [Parameter(Mandatory)][string]$SessionKey,
+        [Parameter(Mandatory)][hashtable]$Session
+    )
+    Initialize-AppDataDir
+    $debugDir = Join-Path $script:AppDataDir 'debug'
+    if (-not (Test-Path -LiteralPath $debugDir)) {
+        New-Item -ItemType Directory -Path $debugDir -Force | Out-Null
+    }
+    $ts = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $safeKey = $SessionKey -replace '[^A-Za-z0-9._-]', '_'
+    $outPath = Join-Path $debugDir "evidence-$safeKey-$ts.txt"
+
+    $logPath        = if ($Session.ContainsKey('log_path'))         { [string]$Session.log_path }         else { '' }
+    $ansysclPid     = if ($Session.ContainsKey('ansyscl_pid'))      { [string]$Session.ansyscl_pid }      else { '' }
+    $sessState      = if ($Session.ContainsKey('state'))            { [string]$Session.state }            else { '' }
+    $firstSeen      = if ($Session.ContainsKey('first_seen_at'))    { [string]$Session.first_seen_at }    else { '' }
+    $firstElastic   = if ($Session.ContainsKey('first_elastic_at')) { [string]$Session.first_elastic_at } else { '' }
+    $byteOffset     = if ($Session.ContainsKey('byte_offset'))      { [string]$Session.byte_offset }      else { '' }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("Ansys Elastic Licence Monitor - debug evidence")
+    [void]$sb.AppendLine("Generated:        $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$sb.AppendLine("Session key:      $SessionKey")
+    [void]$sb.AppendLine("ACL log path:     $logPath")
+    [void]$sb.AppendLine("ansyscl PID:      $ansysclPid")
+    [void]$sb.AppendLine("Session state:    $sessState")
+    [void]$sb.AppendLine("First seen at:    $firstSeen")
+    [void]$sb.AppendLine("First elastic at: $firstElastic")
+    [void]$sb.AppendLine("Byte offset:      $byteOffset")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Regex used (common.ps1 $ElasticCheckoutPattern):')
+    [void]$sb.AppendLine("  $script:ElasticCheckoutPattern")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Currently held elastic features (feature -> first-seen-at):')
+    if ($Session.ContainsKey('held_elastic') -and $Session.held_elastic) {
+        foreach ($f in @($Session.held_elastic.Keys)) {
+            [void]$sb.AppendLine("  $f => $($Session.held_elastic[$f])")
+        }
+    }
+    [void]$sb.AppendLine('')
+
+    $lines = @()
+    if ($Session.ContainsKey('recent_elastic_lines') -and $Session.recent_elastic_lines) {
+        $lines = @($Session.recent_elastic_lines)
+    }
+    # Fallback: rescan last 64 KB of the live log if the ring is empty.
+    if ($lines.Count -eq 0 -and $logPath -and (Test-Path -LiteralPath $logPath)) {
+        try {
+            $size = (Get-Item -LiteralPath $logPath).Length
+            $off  = [Math]::Max([long]0, $size - 65536)
+            $tail = Read-NewLogContent -Path $logPath -Offset $off
+            foreach ($m in (Find-ElasticCheckouts -Content $tail.Content)) {
+                $lines += @{ kind = 'match'; ts = $m.Timestamp; feature = $m.Feature; user = $m.User; line = $m.RawLine }
+            }
+        } catch {
+            Write-AgentLog "Write-DebugEvidenceFile: tail rescan failed for $logPath : $_" -Level WARN
+        }
+    }
+
+    [void]$sb.AppendLine("Matched / near-miss lines (most recent last, max $($script:DebugRecentLinesCap)):")
+    if ($lines.Count -eq 0) {
+        [void]$sb.AppendLine('  (none captured)')
+    } else {
+        foreach ($e in @($lines | Select-Object -Last $script:DebugRecentLinesCap)) {
+            $kind    = if ($e.ContainsKey('kind'))    { [string]$e.kind }    else { '?' }
+            $line    = if ($e.ContainsKey('line'))    { [string]$e.line }    else { '' }
+            $feature = if ($e.ContainsKey('feature')) { [string]$e.feature } else { '' }
+            $user    = if ($e.ContainsKey('user'))    { [string]$e.user }    else { '' }
+            [void]$sb.AppendLine("  [$kind] feature=$feature user=$user")
+            [void]$sb.AppendLine("    $line")
+        }
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('If this looks like a false positive, attach this file when reporting it.')
+
+    Set-Content -LiteralPath $outPath -Value $sb.ToString() -Encoding UTF8
+    return $outPath
 }
 
 function Write-ToastQueueEntry {
@@ -504,19 +675,39 @@ function Unregister-ToastProtocol {
 }
 
 function Read-ToastQueue {
-    if (-not (Test-Path $script:QueueFilePath)) { return @() }
+    $tempPath = "$($script:QueueFilePath).processing"
     try {
-        # Atomic drain: rename then read.
-        $tempPath = "$($script:QueueFilePath).processing"
-        if (Test-Path $tempPath) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
-        Move-Item -Path $script:QueueFilePath -Destination $tempPath -Force -ErrorAction Stop
+        $haveLeftover = Test-Path -LiteralPath $tempPath
+        $haveQueue    = Test-Path -LiteralPath $script:QueueFilePath
+        if (-not $haveLeftover -and -not $haveQueue) { return @() }
+
+        if ($haveQueue) {
+            if ($haveLeftover) {
+                # A prior drain crashed after claiming the queue (the rename) but
+                # before its events were applied + saved. The old behaviour deleted
+                # that leftover unread, silently dropping those clicks. Instead claim
+                # the live queue (atomic rename, so concurrent toast-callback writes
+                # land in a fresh queue file), fold it onto the leftover, and drain
+                # the union.
+                $incoming = "$tempPath.incoming"
+                Move-Item -Path $script:QueueFilePath -Destination $incoming -Force -ErrorAction Stop
+                Get-Content -LiteralPath $incoming -ErrorAction SilentlyContinue |
+                    Add-Content -LiteralPath $tempPath -Encoding UTF8 -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $incoming -Force -ErrorAction SilentlyContinue
+            } else {
+                # Atomic drain: rename then read.
+                Move-Item -Path $script:QueueFilePath -Destination $tempPath -Force -ErrorAction Stop
+            }
+        }
+        # else: only a leftover .processing exists -- drain it as-is.
+
         $events = @()
-        foreach ($line in (Get-Content $tempPath -ErrorAction SilentlyContinue)) {
+        foreach ($line in (Get-Content -LiteralPath $tempPath -ErrorAction SilentlyContinue)) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             try { $events += ($line | ConvertFrom-Json) }
             catch { Write-AgentLog "Bad queue line: $line" -Level WARN }
         }
-        Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
         return $events
     } catch {
         Write-AgentLog "Failed to read toast queue: $_" -Level WARN
@@ -557,15 +748,32 @@ function Load-State {
                     $candidate = [string]$v.next_prompt_at
                     try { [void][datetime]::Parse($candidate); $nextPrompt = $candidate } catch {}
                 }
+                # recent_elastic_lines is the debug-build ring of recent matched
+                # + near-miss lines. Always backfilled to an empty array so a
+                # state file written by a non-debug build loads cleanly.
+                $recentLines = @()
+                if ($vProps -contains 'recent_elastic_lines' -and $v.recent_elastic_lines) {
+                    foreach ($entry in @($v.recent_elastic_lines)) {
+                        $eProps = $entry.PSObject.Properties.Name
+                        $recentLines += @{
+                            kind    = if ($eProps -contains 'kind')    { [string]$entry.kind }    else { 'match' }
+                            ts      = if ($eProps -contains 'ts')      { [string]$entry.ts }      else { '' }
+                            feature = if ($eProps -contains 'feature') { [string]$entry.feature } else { '' }
+                            user    = if ($eProps -contains 'user')    { [string]$entry.user }    else { '' }
+                            line    = if ($eProps -contains 'line')    { [string]$entry.line }    else { '' }
+                        }
+                    }
+                }
                 $sessions[$prop.Name] = @{
-                    log_path         = if ($vProps -contains 'log_path')         { [string]$v.log_path } else { '' }
-                    byte_offset      = if ($vProps -contains 'byte_offset')      { [long]$v.byte_offset } else { 0 }
-                    ansyscl_pid      = if ($vProps -contains 'ansyscl_pid')      { [int]$v.ansyscl_pid } else { 0 }
-                    first_seen_at    = if ($vProps -contains 'first_seen_at')    { [string]$v.first_seen_at } else { '' }
-                    first_elastic_at = if ($vProps -contains 'first_elastic_at') { [string]$v.first_elastic_at } else { '' }
-                    next_prompt_at   = $nextPrompt
-                    state            = if ($vProps -contains 'state')            { [string]$v.state } else { 'NEW' }
-                    held_elastic     = $heldElastic
+                    log_path             = if ($vProps -contains 'log_path')         { [string]$v.log_path } else { '' }
+                    byte_offset          = if ($vProps -contains 'byte_offset')      { [long]$v.byte_offset } else { 0 }
+                    ansyscl_pid          = if ($vProps -contains 'ansyscl_pid')      { [int]$v.ansyscl_pid } else { 0 }
+                    first_seen_at        = if ($vProps -contains 'first_seen_at')    { [string]$v.first_seen_at } else { '' }
+                    first_elastic_at     = if ($vProps -contains 'first_elastic_at') { [string]$v.first_elastic_at } else { '' }
+                    next_prompt_at       = $nextPrompt
+                    state                = if ($vProps -contains 'state')            { [string]$v.state } else { 'NEW' }
+                    held_elastic         = $heldElastic
+                    recent_elastic_lines = $recentLines
                 }
             }
         }
@@ -600,10 +808,18 @@ function Save-State {
     if (-not $State.ContainsKey('schema_version')) {
         $State.schema_version = $script:StateSchemaVersion
     }
+    $json = $State | ConvertTo-Json -Depth 10
+    # Dirty check: skip the disk write + atomic rename when the serialised state
+    # is byte-identical to what we last wrote. Save-State runs every loop iteration
+    # (and twice on click iterations); in steady state nothing changes, so this
+    # elides ~all of the otherwise-continuous state.json writes. A false "dirty"
+    # (e.g. a hashtable key reorder) only over-writes; it never under-writes.
+    if ($json -eq $script:LastSavedStateJson) { return }
     $tmp = "$($script:StateFilePath).tmp"
     try {
-        $State | ConvertTo-Json -Depth 10 | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
+        $json | Set-Content -Path $tmp -Encoding UTF8 -ErrorAction Stop
         Move-Item -LiteralPath $tmp -Destination $script:StateFilePath -Force -ErrorAction Stop
+        $script:LastSavedStateJson = $json
     } catch {
         Write-AgentLog "Failed to atomically write state: $_" -Level ERROR
         if (Test-Path -LiteralPath $tmp) {
@@ -658,33 +874,48 @@ function Get-FeatureDisplayName {
 }
 
 function Invoke-LmutilWithTimeout {
-    # Wraps a single lmutil invocation in a hard timeout, because the bare
-    # TCP probe doesn't catch "reachable-but-hung server" (in which case
-    # lmutil blocks for ~30s, freezing the entire agent loop). We run lmutil
-    # in a background job and either wait for it or kill it.
+    # Wraps a single lmutil invocation in a hard timeout, because the bare TCP
+    # probe doesn't catch "reachable-but-hung server" (lmutil then blocks ~30s,
+    # freezing the entire agent loop). Runs lmutil as a child Process so a timeout
+    # can Kill() the exact PID -- the old Start-Job approach left lmutil.exe
+    # orphaned (one per timed-out toast) until its own ~30s timeout, because
+    # Remove-Job tears down only the job runspace, not its external grandchild.
     param(
         [Parameter(Mandatory)][string]$LmutilPath,
         [Parameter(Mandatory)][string[]]$ArgList,
         [int]$TimeoutSeconds = 5
     )
-    $job = $null
+    $proc = $null
     try {
-        $job = Start-Job -ScriptBlock {
-            param($exe, $args)
-            & $exe @args 2>&1 | Out-String
-        } -ArgumentList $LmutilPath, $ArgList
-        if (Wait-Job -Job $job -Timeout $TimeoutSeconds) {
-            return ([string](Receive-Job -Job $job -ErrorAction SilentlyContinue))
+        # Quote only args that need it; lmstat's args (feature name, port@host)
+        # are token-like, so this matches the prior native-call behaviour.
+        $quoted = $ArgList | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
         }
-        Write-AgentLog "lmutil timed out after ${TimeoutSeconds}s (args: $($ArgList -join ' '))" -Level WARN
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $LmutilPath
+        $psi.Arguments              = ($quoted -join ' ')
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute        = $false
+        $psi.CreateNoWindow         = $true
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # Read both streams async before waiting, or a child that fills a pipe
+        # buffer would deadlock against WaitForExit.
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        if ($proc.WaitForExit($TimeoutSeconds * 1000)) {
+            return ([string]($outTask.Result + $errTask.Result))
+        }
+        Write-AgentLog "lmutil timed out after ${TimeoutSeconds}s (args: $($ArgList -join ' ')); killing pid $($proc.Id)" -Level WARN
+        try { $proc.Kill() } catch {}
         return ''
     } catch {
-        Write-AgentLog "lmutil job failed: $_" -Level WARN
+        Write-AgentLog "lmutil invocation failed: $_" -Level WARN
         return ''
     } finally {
-        if ($job) {
-            try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch {}
-        }
+        if ($proc) { try { $proc.Dispose() } catch {} }
     }
 }
 
@@ -759,10 +990,24 @@ function Test-AnsysConfig {
     #
     # Parameters exist so tests can point this at fixture paths.
     param(
-        [string]$AnsyslmdIniPath  = $script:AnsyslmdIniPath,
+        [string]$AnsyslmdIniPath  = '',
         [string]$AnsysUserAppData = $script:AnsysUserAppData
     )
     $findings = @()
+
+    # Resolve the ini once via the same discovery the rest of the agent uses.
+    # The canonical C:\...\Shared Files\licensing\ansyslmd.ini may be absent while
+    # a per-version <ver>\Shared Files\Licensing\ansyslmd.ini exists -- if the
+    # check reads one file and the fix writes another, the "fix" creates a brand-
+    # new canonical file ANSYS never reads (and M1 makes that failure invisible).
+    # The resolved path is carried on the finding so the fix-bat writes the same
+    # file we inspected. Tests pass an explicit fixture path, which wins.
+    if ([string]::IsNullOrWhiteSpace($AnsyslmdIniPath)) {
+        $AnsyslmdIniPath = (Get-AnsysEnvironment).AnsyslmdIniPath
+        if ([string]::IsNullOrWhiteSpace($AnsyslmdIniPath)) {
+            $AnsyslmdIniPath = $script:AnsyslmdIniPath   # canonical default (used to create if nothing exists)
+        }
+    }
 
     # --- ansyslmd.ini ---
     $expectedServer = Get-ExpectedAnsysServer
@@ -786,6 +1031,7 @@ function Test-AnsysConfig {
                 expected        = $expectedServer
                 actual          = $actualServer
                 fixDescription  = "Set $AnsyslmdIniPath to 'SERVER=$expectedServer'"
+                ini_path        = $AnsyslmdIniPath
             }
         }
     }
@@ -814,13 +1060,29 @@ function Test-AnsysConfig {
         $versionDirs = @(Get-AnsysVersionDirs -Root $AnsysUserAppData)
         foreach ($v in $versionDirs) {
             foreach ($app in $reqLO.Keys) {
+                # $app is interpolated into a path that gets XML-loaded and, when
+                # remediating, .Save()-d as admin. Reject anything that isn't a
+                # plain prefix so a hostile or typo'd central-config key can't
+                # traverse out of the version dir (e.g. '..\..\..\Windows\...').
+                if ($app -notmatch '^[A-Za-z0-9_]+$') {
+                    Write-AgentLog "Ignoring requiredLicenseOptions key '$app' (must be letters/digits/underscore)" -Level WARN
+                    continue
+                }
                 $expectedName = [string]$reqLO[$app]
                 if (-not $expectedName) { continue }
                 $xmlPath = Join-Path $v.FullName "$($app)LicenseOptions.xml"
                 if (-not (Test-Path -LiteralPath $xmlPath)) { continue }   # app not installed for this version
                 $actualName = ''
                 try {
-                    [xml]$doc = Get-Content -LiteralPath $xmlPath -Raw -ErrorAction Stop
+                    # DtdProcessing=Prohibit + null resolver: a crafted *LicenseOptions.xml
+                    # with a billion-laughs entity expansion would otherwise OOM/hang the
+                    # parser. The bare [xml] accelerator processes internal DTD entities.
+                    $rdrSettings = New-Object System.Xml.XmlReaderSettings
+                    $rdrSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+                    $rdrSettings.XmlResolver   = $null
+                    $doc = New-Object System.Xml.XmlDocument
+                    $reader = [System.Xml.XmlReader]::Create($xmlPath, $rdrSettings)
+                    try { $doc.Load($reader) } finally { $reader.Dispose() }
                     $node = $doc.SelectSingleNode("//LicenseInfo[@Active='1']")
                     if ($node) { $actualName = [string]$node.LicenseName }
                 } catch {
@@ -860,6 +1122,30 @@ function Get-AnsysConfigFindingsHash {
         $hash = $sha.ComputeHash($bytes)
         return -join ($hash | ForEach-Object { $_.ToString('x2') })
     } finally { $sha.Dispose() }
+}
+
+function Test-SafeFixTargetPath {
+    # Defence-in-depth for the one elevated code path. The fix-bat writes to
+    # paths that can originate from the central config (a network-share file
+    # editable by people other than the workstation user) and it *creates* the
+    # target if absent -- so a bad path means an elevated create/overwrite at an
+    # attacker- or typo-chosen location. Reject anything that could redirect it:
+    #   - empty / whitespace
+    #   - any '..' traversal segment
+    #   - not a fully-qualified local (C:\...) or UNC (\\server\share\...) path
+    # A legitimate ansyslmd.ini / *LicenseOptions.xml target is always a fully-
+    # qualified path with no '..', so this never rejects a valid config. It does
+    # not defend against a fully-hostile config that also rewrites the expected
+    # roots -- the trusted-share assumption covers that residue (see REVIEW M2).
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    foreach ($seg in ($Path -split '[\\/]')) {
+        if ($seg -eq '..') { return $false }
+    }
+    # Drive-rooted 'C:\...'/'C:/...' or UNC '\\host\...'. Rejects bare names,
+    # relative paths, and drive-relative 'C:foo'.
+    if ($Path -notmatch '^[A-Za-z]:[\\/]' -and $Path -notmatch '^[\\/]{2}[^\\/]') { return $false }
+    return $true
 }
 
 function New-AnsysConfigFixBat {
@@ -909,11 +1195,25 @@ function New-AnsysConfigFixBat {
     foreach ($f in $Findings) {
         switch -Wildcard ($f.key) {
             'server.ansyslmd_ini' {
-                $iniPath = $script:AnsyslmdIniPath
+                # M3: write the same file the check inspected (carried on the
+                # finding), falling back to canonical only for legacy findings.
+                $iniPath = if ($f.ContainsKey('ini_path') -and $f.ini_path) { [string]$f.ini_path } else { $script:AnsyslmdIniPath }
+                # M2: this is an elevated write whose target can come from config.
+                if (-not (Test-SafeFixTargetPath $iniPath)) {
+                    Write-AgentLog "Skipping ansyslmd.ini fix: unsafe target path '$iniPath'" -Level WARN
+                    $lines += "REM Skipped $($f.key): unsafe target path '$iniPath'"
+                    $lines += ''
+                    continue
+                }
                 $expServer = [string]$f.expected
                 # In-place SERVER= rewrite, preserving other lines. Idempotent:
-                # running twice yields the same end state.
+                # running twice yields the same end state. $ErrorActionPreference
+                # = Stop + try/catch/exit 1 so a failed write (read-only dir, ACL,
+                # or file held open by a running ANSYS) reports FAILED instead of
+                # a false "OK" -- Set-Content's failure is otherwise non-terminating.
                 $cmd = @"
+`$ErrorActionPreference = 'Stop'
+try {
 `$ini = $(Escape-PsSQ $iniPath)
 `$exp = $(Escape-PsSQ $expServer)
 `$bak = `$ini + '.bak-$ts'
@@ -930,6 +1230,10 @@ if (Test-Path -LiteralPath `$ini) {
     `$parent = Split-Path -Parent `$ini
     if (`$parent -and -not (Test-Path -LiteralPath `$parent)) { New-Item -ItemType Directory -Path `$parent -Force | Out-Null }
     Set-Content -LiteralPath `$ini -Value ("SERVER=`$exp") -Encoding ASCII
+}
+} catch {
+    Write-Error `$_ -ErrorAction Continue
+    exit 1
 }
 "@
                 $enc = ConvertTo-EncodedPsCommand $cmd
@@ -950,18 +1254,36 @@ if (Test-Path -LiteralPath `$ini) {
             'licopt.*' {
                 $xmlPath = [string]$f.xml_path
                 $expName = [string]$f.expected
+                # M2: defence-in-depth on the elevated write target. The app key is
+                # already validated in Test-AnsysConfig, but re-check the full path.
+                if (-not (Test-SafeFixTargetPath $xmlPath)) {
+                    Write-AgentLog "Skipping $($f.key) fix: unsafe target path '$xmlPath'" -Level WARN
+                    $lines += "REM Skipped $($f.key): unsafe target path '$xmlPath'"
+                    $lines += ''
+                    continue
+                }
                 # Parse-and-edit so non-LicenseInfo nodes/attributes are
                 # preserved. If no active LicenseInfo exists, one is created.
+                # $ErrorActionPreference=Stop + try/catch/exit 1 surfaces a failed
+                # write; DtdProcessing=Prohibit blocks DTD-entity expansion in this
+                # elevated parse of a user-controlled file.
                 $cmd = @"
+`$ErrorActionPreference = 'Stop'
+try {
 `$path = $(Escape-PsSQ $xmlPath)
 `$exp  = $(Escape-PsSQ $expName)
 `$bak  = `$path + '.bak-$ts'
 `$parent = Split-Path -Parent `$path
 if (`$parent -and -not (Test-Path -LiteralPath `$parent)) { New-Item -ItemType Directory -Path `$parent -Force | Out-Null }
+`$rdrSettings = New-Object System.Xml.XmlReaderSettings
+`$rdrSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+`$rdrSettings.XmlResolver   = `$null
 if (Test-Path -LiteralPath `$path) {
     Copy-Item -LiteralPath `$path -Destination `$bak -Force -ErrorAction SilentlyContinue
     try {
-        [xml]`$doc = Get-Content -LiteralPath `$path -Raw -ErrorAction Stop
+        `$doc = New-Object System.Xml.XmlDocument
+        `$reader = [System.Xml.XmlReader]::Create(`$path, `$rdrSettings)
+        try { `$doc.Load(`$reader) } finally { `$reader.Dispose() }
     } catch {
         `$doc = New-Object System.Xml.XmlDocument
         `$null = `$doc.AppendChild(`$doc.CreateElement('Licenses'))
@@ -979,6 +1301,10 @@ if (-not `$active) {
 }
 `$active.SetAttribute('LicenseName', `$exp)
 `$doc.Save(`$path)
+} catch {
+    Write-Error `$_ -ErrorAction Continue
+    exit 1
+}
 "@
                 $enc = ConvertTo-EncodedPsCommand $cmd
                 $lines += "REM Fix: $($f.key)"
@@ -1107,6 +1433,25 @@ function Invoke-ConfigCheckCycle {
     }
 }
 
+# The BurntToast version the toast code is tested against. install.ps1 installs
+# exactly this version; Import-PinnedBurntToast prefers it so a newer copy on the
+# machine (PSGallery latest is 1.x, untested here) is not picked up by default.
+$script:BurntToastVersion = '0.8.5'
+
+function Import-PinnedBurntToast {
+    # Throws if no BurntToast is available at all; callers handle that.
+    $pinned = Get-Module -ListAvailable -Name BurntToast -ErrorAction SilentlyContinue |
+        Where-Object { $_.Version -eq [version]$script:BurntToastVersion } | Select-Object -First 1
+    if ($pinned) {
+        Import-Module $pinned.Path -ErrorAction Stop | Out-Null
+        Write-AgentLog "BurntToast $($script:BurntToastVersion) loaded"
+    } else {
+        Import-Module BurntToast -ErrorAction Stop | Out-Null
+        $v = (Get-Module BurntToast).Version
+        Write-AgentLog "BurntToast $($script:BurntToastVersion) not installed; loaded untested version $v instead" -Level WARN
+    }
+}
+
 function Get-AgentVersion {
     # Single source of truth for the agent's version string. Read from the
     # VERSION file next to common.ps1 so installer.iss and the agent can
@@ -1190,4 +1535,11 @@ function Show-AgentSelfTestToast {
 # Apply config.json overrides at dot-source time so every consumer (agent.ps1,
 # test-parser.ps1, test-perpetual.ps1) sees the resolved values without each
 # one having to call this explicitly.
-Import-AppConfig
+#
+# toast-callback.ps1 sets ANSYS_ELM_SKIP_AUTOCONFIG=1 before dot-sourcing: it
+# only needs the queue-write + path/log helpers, and re-reading config.json (and
+# possibly a UNC central config) on every single button click is wasted I/O. The
+# callback never touches any config-derived var, so skipping the load is safe.
+if ($env:ANSYS_ELM_SKIP_AUTOCONFIG -ne '1') {
+    Import-AppConfig
+}

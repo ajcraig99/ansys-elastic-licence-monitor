@@ -21,6 +21,7 @@ $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $My
 
 $tests = @(
     @{ Name = 'parser';      File = 'test-parser.ps1' }
+    @{ Name = 'config';      File = 'test-config.ps1' }
     @{ Name = 'configcheck'; File = 'test-configcheck.ps1' }
 )
 if ($IncludePerpetual) {

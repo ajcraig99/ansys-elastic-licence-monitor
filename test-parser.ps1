@@ -27,6 +27,10 @@ Write-Host ""
 
 foreach ($m in $matches) {
     "  {0}  {1,-15}  {2,-20}  user={3}" -f $m.Timestamp, $m.Action, $m.Feature, $m.User
+    if ([string]::IsNullOrEmpty($m.RawLine)) {
+        Write-Host ("FAIL: RawLine empty for feature={0} (debug evidence needs it)" -f $m.Feature) -ForegroundColor Red
+        exit 1
+    }
 }
 Write-Host ""
 

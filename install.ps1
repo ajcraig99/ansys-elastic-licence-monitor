@@ -3,7 +3,13 @@
 # This file is part of Ansys Elastic Licence Monitor. See LICENSE for terms.
 
 [CmdletBinding()]
-param()
+param(
+    # Set by the debug build of the Inno installer (ISCC /DDebugBuild=1).
+    # Flips debug.enabled=true in the installed config.json so the agent
+    # surfaces View-triggers / Open-full-log toast buttons and verbose
+    # match/near-miss logging. The release installer never passes this.
+    [switch]$DebugBuild
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -45,7 +51,7 @@ try {
 if ($samePath) {
     Write-Host "  Source dir is install dir; skipping file copy"
 } else {
-    $filesToCopy = @('agent.ps1', 'common.ps1', 'toast-callback.ps1', 'toast-callback.vbs')
+    $filesToCopy = @('agent.ps1', 'agent-launcher.vbs', 'common.ps1', 'toast-callback.ps1', 'toast-callback.vbs')
     foreach ($f in $filesToCopy) {
         $src = Join-Path $sourceDir $f
         if (-not (Test-Path $src)) {
@@ -80,21 +86,55 @@ if ($samePath) {
     }
 }
 
-# 3. Install BurntToast if absent. Pinned to a known-good version so a future
-#    breaking release from the upstream module doesn't silently break the agent.
-#    Bump when validating a newer release.
+# 2b. Debug build: flip debug.enabled in the installed config.json via a JSON
+#     merge so we preserve any other user/admin edits (config.json copy uses
+#     onlyifdoesntexist, so an upgrade may be sitting on a customised file).
+#     This is a one-way switch: the release installer does NOT clear the flag
+#     on its own. To leave debug, edit config.json or uninstall + reinstall.
+if ($DebugBuild) {
+    Write-Host "  Debug build requested; enabling debug mode in config.json"
+    $cfgPath = Join-Path $InstallDir 'config.json'
+    try {
+        if (Test-Path -LiteralPath $cfgPath) {
+            $existing = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+        } else {
+            $existing = [PSCustomObject]@{}
+        }
+        $existingProps = $existing.PSObject.Properties.Name
+        if ($existingProps -notcontains 'debug') {
+            $existing | Add-Member -NotePropertyName 'debug' -NotePropertyValue ([PSCustomObject]@{ enabled = $true })
+        } else {
+            $dbgProps = $existing.debug.PSObject.Properties.Name
+            if ($dbgProps -contains 'enabled') {
+                $existing.debug.enabled = $true
+            } else {
+                $existing.debug | Add-Member -NotePropertyName 'enabled' -NotePropertyValue $true
+            }
+        }
+        $existing | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+        Write-Host "  Set debug.enabled = true in $cfgPath"
+    } catch {
+        Write-Host "  WARN: failed to set debug.enabled in $cfgPath : $_"
+    }
+}
+
+# 3. Install BurntToast if absent. Pinned to exactly the version the agent is
+#    tested against (-RequiredVersion, side by side with any other installed
+#    version) -- the PSGallery latest is 1.x, which has not been validated.
+#    agent.ps1 imports this exact version when present. Bump both together
+#    ($script:BurntToastVersion in common.ps1) after validating a newer release.
 #
 #    The actual install runs in a background job with a hard timeout because
 #    Install-PackageProvider and Install-Module have NO native timeout and
 #    can hang for minutes on slow networks, corporate proxies, or invisible
 #    prompts (the Inno [Run] step uses runhidden waituntilterminated, so any
 #    interactive prompt sits forever waiting for input that can't arrive).
-$BurntToastMinVersion = '0.8.5'
-$existing = Get-Module -ListAvailable -Name BurntToast | Sort-Object Version -Descending | Select-Object -First 1
-if (-not $existing -or $existing.Version -lt [version]$BurntToastMinVersion) {
-    Write-Host "  Installing BurntToast PowerShell module $BurntToastMinVersion+ (CurrentUser scope, up to ${burntToastInstallTimeoutSec}s)..."
+$BurntToastVersion = '0.8.5'
+$existing = Get-Module -ListAvailable -Name BurntToast | Where-Object { $_.Version -eq [version]$BurntToastVersion } | Select-Object -First 1
+if (-not $existing) {
+    Write-Host "  Installing BurntToast PowerShell module $BurntToastVersion (CurrentUser scope, up to ${burntToastInstallTimeoutSec}s)..."
     $job = Start-Job -ScriptBlock {
-        param($MinVersion)
+        param($Version)
         $ErrorActionPreference = 'Stop'
         # Re-apply TLS 1.2 inside the job (separate runspace, fresh defaults).
         try {
@@ -108,8 +148,8 @@ if (-not $existing -or $existing.Version -lt [version]$BurntToastMinVersion) {
         # version skipped this entirely if Get-PSRepository returned nothing,
         # which left Install-Module to emit a hidden "untrusted repo" prompt.
         try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue } catch {}
-        Install-Module -Name BurntToast -MinimumVersion $MinVersion -Scope CurrentUser -Force -AllowClobber -Confirm:$false
-    } -ArgumentList $BurntToastMinVersion
+        Install-Module -Name BurntToast -RequiredVersion $Version -Scope CurrentUser -Force -AllowClobber -Confirm:$false
+    } -ArgumentList $BurntToastVersion
 
     $completed = Wait-Job -Job $job -Timeout $burntToastInstallTimeoutSec
     if (-not $completed) {
@@ -131,11 +171,15 @@ if (-not $existing -or $existing.Version -lt [version]$BurntToastMinVersion) {
     Write-Host "  BurntToast already installed (v$($existing.Version))"
 }
 
-# 4. Register scheduled task: At Logon, current user, hidden window.
-$agentPath = Join-Path $InstallDir 'agent.ps1'
+# 4. Register scheduled task: At Logon, current user, no window.
+#    The task runs wscript.exe on agent-launcher.vbs rather than powershell.exe
+#    directly: with Windows Terminal as the default terminal (Windows 11),
+#    powershell.exe -WindowStyle Hidden leaves a visible Terminal window open
+#    for the agent's whole lifetime. //B suppresses any script-error dialog.
+$launcherPath = Join-Path $InstallDir 'agent-launcher.vbs'
 $action = New-ScheduledTaskAction `
-    -Execute 'powershell.exe' `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$agentPath`""
+    -Execute 'wscript.exe' `
+    -Argument "//B //Nologo `"$launcherPath`""
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 
@@ -152,9 +196,28 @@ $principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Limited
 
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    if ($existingTask.State -eq 'Running') {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
+
+# Stop any agent still running from a previous install. Inno Setup installs over
+# the top without running the old uninstaller, and the running agent holds the
+# single-instance mutex -- so without this the freshly started agent exits at
+# once and the old code (and, pre-launcher, its visible window) runs until logoff.
+# Same full-path match as uninstall.ps1 so unrelated PowerShell is left alone.
+$agentPattern = [regex]::Escape((Join-Path $InstallDir 'agent.ps1'))
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match $agentPattern -and $_.CommandLine -notmatch '-Status' } |
+    ForEach-Object {
+        try {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+            Write-Host "  Stopped previously running agent (PID $($_.ProcessId))"
+        } catch {}
+    }
 
 Register-ScheduledTask `
     -TaskName    $TaskName `
@@ -180,7 +243,7 @@ Write-Host "  Agent started"
 #    will run the same check on its first iteration, but that may be a few
 #    seconds later; running it here is the explicit "on first install" trigger.
 try {
-    Import-Module BurntToast -ErrorAction Stop | Out-Null
+    Import-PinnedBurntToast
     $installState = Load-State
     Invoke-ConfigCheckCycle -State $installState -RunMode Install
     Save-State -State $installState

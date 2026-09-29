@@ -10,5 +10,8 @@
     "ansyslmdServer": "",
     "forbiddenUserEnvVars": [],
     "requiredLicenseOptions": {}
+  },
+  "debug": {
+    "enabled": false
   }
 }

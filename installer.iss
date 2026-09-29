@@ -14,6 +14,15 @@
 ; The default value is baked into the .exe but is NOT in the public source.
 ; Public builds (no build-config.iss, no /D switch) ship with an empty default.
 ;
+; To produce a DEBUG build that ships the View-triggers / Open-full-log toast
+; buttons, near-miss logging, and a "Run ANSYS checks now (Debug)" Start-menu
+; shortcut:
+;   ISCC.exe /DDebugBuild=1 installer.iss
+; Output:  dist\AnsysElasticLicenceMonitor-Debug-Setup.exe
+; Same AppId as release, so debug installs in place over release (and vice
+; versa). Add/Remove Programs displays the "(Debug)" suffix so testers can
+; tell which build they have.
+;
 ; This wrapper is a thin file-delivery + invocation shell over install.ps1 /
 ; uninstall.ps1, which remain the canonical install logic. The .exe is currently
 ; UNSIGNED -- testers will see SmartScreen "Windows protected your PC"; tell
@@ -27,6 +36,18 @@
   #define DefaultConfigSource ""
 #endif
 
+#ifndef DebugBuild
+  #define DebugBuild "0"
+#endif
+
+#if DebugBuild == "1"
+  #define AppDisplayName "Ansys Elastic Licence Monitor (Debug)"
+  #define OutputBase     "AnsysElasticLicenceMonitor-Debug-Setup"
+#else
+  #define AppDisplayName "Ansys Elastic Licence Monitor"
+  #define OutputBase     "AnsysElasticLicenceMonitor-Setup"
+#endif
+
 ; Single source of truth for the agent version: VERSION file at repo root.
 ; Read once at compile time; agent.ps1 / Get-AgentVersion reads it at runtime.
 #define VersionFileHandle FileOpen("VERSION")
@@ -36,7 +57,7 @@
 [Setup]
 ; AppId is fixed forever -- changing it breaks upgrade detection on installed machines.
 AppId={{FD570A3F-0D93-4A09-BACD-F5F99D919EBB}
-AppName=Ansys Elastic Licence Monitor
+AppName={#AppDisplayName}
 AppVersion={#AppVer}
 AppPublisher=Arron Craig
 AppPublisherURL=
@@ -48,21 +69,22 @@ DisableDirPage=yes
 DisableReadyPage=no
 PrivilegesRequired=lowest
 OutputDir=dist
-OutputBaseFilename=AnsysElasticLicenceMonitor-Setup
+OutputBaseFilename={#OutputBase}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 Uninstallable=yes
 UsePreviousAppDir=yes
-; CloseApplications=yes makes Inno detect file locks on agent.ps1 (running under
-; powershell.exe) during upgrade and prompt the user. The standard upgrade path
-; (Inno auto-invokes prior uninstaller, which kills the agent) usually beats it
-; to the punch, but this is the belt-and-braces fallback for direct overwrites.
+; CloseApplications=yes asks Restart Manager to close apps holding our files
+; open. It rarely fires: powershell.exe reads agent.ps1 and closes it, so the
+; running agent holds no lock. Inno also does not run the prior uninstaller on
+; upgrade -- install.ps1 stops the running agent itself before restarting it.
 CloseApplications=yes
 RestartApplications=no
 
 [Files]
 Source: "agent.ps1";          DestDir: "{app}"; Flags: ignoreversion
+Source: "agent-launcher.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "common.ps1";         DestDir: "{app}"; Flags: ignoreversion
 Source: "install.ps1";        DestDir: "{app}"; Flags: ignoreversion
 Source: "uninstall.ps1";      DestDir: "{app}"; Flags: ignoreversion
@@ -74,6 +96,17 @@ Source: "VERSION";            DestDir: "{app}"; Flags: ignoreversion
 ; A reinstall over the top will NOT clobber a customised config. To force
 ; replacement, uninstall first (which wipes {app}) then re-run setup.
 Source: "config.json";        DestDir: "{app}"; Flags: onlyifdoesntexist
+#if DebugBuild == "1"
+; Debug-only: tiny .cmd that drops a sentinel file the agent loop picks up to
+; force-run the compliance check on demand. Surfaced via the Start-menu icon
+; below. Not shipped in release builds.
+Source: "trigger-check.cmd";  DestDir: "{app}"; Flags: ignoreversion
+#endif
+
+#if DebugBuild == "1"
+[Icons]
+Name: "{group}\Run ANSYS checks now (Debug)"; Filename: "{app}\trigger-check.cmd"; WorkingDir: "{app}"
+#endif
 
 [Messages]
 ; Override the default "Setup has finished installing X. Click Finish." with
@@ -89,10 +122,17 @@ FinishedLabel=When a paid ANSYS elastic licence is checked out, a Windows toast 
 ;
 ; install.ps1 enforces its own hard timeout on the BurntToast/PSGallery step
 ; so this waituntilterminated cannot deadlock the wizard on a slow network.
+#if DebugBuild == "1"
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"" -DebugBuild"; \
+  Flags: runhidden waituntilterminated; \
+  StatusMsg: "Installing BurntToast module, registering scheduled task, and starting agent (up to ~3 minutes on first install)..."
+#else
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install.ps1"""; \
   Flags: runhidden waituntilterminated; \
   StatusMsg: "Installing BurntToast module, registering scheduled task, and starting agent (up to ~3 minutes on first install)..."
+#endif
 
 [UninstallRun]
 ; uninstall.ps1 -SkipDirRemoval kills the agent, unregisters the task and

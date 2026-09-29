@@ -18,6 +18,7 @@ Currently distributed unsigned — first run hits Windows SmartScreen ("Windows 
 | `common.ps1` | Shared paths, regex, logging, state IO, lmutil parsing, URL-protocol registration, config loader |
 | `config.json` | Site-specific overrides (licence server, perpetual feature list, display names). Read by `common.ps1` at dot-source time, falls back to empty defaults if missing or malformed. |
 | `toast-callback.ps1` | Parses `ansyselastic:` URL, writes click event to queue file |
+| `agent-launcher.vbs` | Hidden launcher the scheduled task runs for `agent.ps1`. Needed because `powershell.exe -WindowStyle Hidden` leaves a visible Windows Terminal window on Windows 11. |
 | `toast-callback.vbs` | Hidden launcher for `toast-callback.ps1` (avoids console flash) |
 | `install.ps1` | Copies files to `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\`, installs BurntToast, registers scheduled task + URL protocol, starts the task. Skips its own copy step when invoked from inside the install dir (the Inno post-install path). `config.json` is copy-only-if-absent so admin edits survive re-install. |
 | `uninstall.ps1` | Reverses install (task, registry, install dir). `-SkipDirRemoval` skips the dir wipe so Inno can own it during installer-driven uninstall. Leaves BurntToast module in place. |
@@ -25,6 +26,7 @@ Currently distributed unsigned — first run hits Windows SmartScreen ("Windows 
 | `sample-acl-log.log` | Fixture for offline regex test (4 elastic events + 4 perpetual events) |
 | `test-parser.ps1` | Validates regex against fixture |
 | `test-perpetual.ps1` | Probes lmutil + perpetual context parser for each feature |
+| `test-config.ps1` | Validates config loading tolerates malformed values (bad port, quoted booleans, invalid JSON) |
 | `test-configcheck.ps1` | Validates compliance check + fix-bat generation against fixture paths (no ANSYS install needed) |
 | `docs/ARCHITECTURE.md` | Detection signal, agent design, dead ends, glossary |
 
@@ -34,7 +36,10 @@ Currently distributed unsigned — first run hits Windows SmartScreen ("Windows 
 [user logs on]
    │
    ▼
-[Scheduled Task: At Logon, current user, hidden window]
+[Scheduled Task: At Logon, current user, runs wscript.exe agent-launcher.vbs]
+   │
+   ▼
+[agent-launcher.vbs starts powershell.exe agent.ps1 with no window]
    │
    ▼
 [agent.ps1 main loop, every $PollIntervalSeconds]
@@ -166,7 +171,7 @@ The few couplings to ANSYS internals are overridable in `config.json` if a futur
 | Path | Purpose |
 |---|---|
 | `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\` | Install root |
-| `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\agent.log` | Rotating log (5 MB, 1 backup) |
+| `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\agent.log` | Rotating log (5 MB, 3 backups) |
 | `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\state.json` | Persisted session state |
 | `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\config.json` | Site overrides. Preserved across in-place reinstalls. |
 | `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\toast-queue.jsonl` | Click events from toast button presses |
@@ -197,10 +202,10 @@ Scheduled task name: `Ansys Elastic Licence Monitor`.
 
 `Fix it` triggers a follow-up **`ANSYS configuration repair launched`** toast confirming the bat was launched and reminding the user to close and re-open ANSYS for changes to take effect.
 
-**Toast 2** (escalation, fires every `EscalationMinutes` after toast 1 until accepted, suppressed, or session ends):
+**Toast 2** (escalation, fires every `EscalationMinutes` after toast 1 until accepted, suppressed, or session ends; the timer pauses while no elastic feature is checked out, and restarts a full `EscalationMinutes` after the next elastic checkout):
 
 - Title: `ANSYS Elastic Licensing - action needed`
-- Body: *"ANSYS elastic licensing has been in use for {EscalationMinutes} min. This costs money for every hour it stays open. Close ANSYS now to stop billing, or click 'Keep billing me' to continue."*
+- Body: *"ANSYS elastic licensing has been in use for {elapsed}. This costs money for every hour it stays open. Close ANSYS now to stop billing, or click 'Keep billing me' to continue."*
 - Button: `Keep billing me`
 - Audio: `ms-winsoundevent:Notification.Looping.Alarm2` (loops while toast on screen)
 - Scenario: `Reminder` (sticky in Action Center, does not auto-dismiss)
@@ -255,7 +260,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 1. Creates `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\`
 2. Copies the agent files from the source folder
 3. Installs BurntToast (PowerShell Gallery, CurrentUser scope, no admin needed)
-4. Registers scheduled task: At Logon, current user, hidden window, restart on failure
+4. Stops any agent still running from a previous install, then registers the scheduled task: At Logon, current user, runs `wscript.exe agent-launcher.vbs` (no window), restart on failure
 5. Registers `ansyselastic:` URL protocol in HKCU
 6. Starts the task immediately so the user does not have to log out / back in
 

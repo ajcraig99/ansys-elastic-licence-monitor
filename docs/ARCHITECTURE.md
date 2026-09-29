@@ -107,7 +107,10 @@ Detection must be workstation-side. Detection of *embedded* feature checkouts (e
 [at user logon]
    │
    ▼
-[Scheduled Task: At Logon, current user, hidden window]
+[Scheduled Task: At Logon, current user, runs wscript.exe agent-launcher.vbs]
+   │
+   ▼
+[agent-launcher.vbs starts powershell.exe agent.ps1 with no window]
    │
    ▼
 [agent.ps1 main loop, every $PollIntervalSeconds]

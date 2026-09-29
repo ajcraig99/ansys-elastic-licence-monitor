@@ -99,6 +99,46 @@ try {
     Assert "decoded payload writes ansyslmd.ini"        (@($decoded | Where-Object { $_ -match 'ansyslmd\.ini' -and $_ -match 'SERVER=' }).Count -ge 1)
     Assert "decoded payload writes Mechanical xml"      (@($decoded | Where-Object { $_ -match 'MechanicalLicenseOptions\.xml' -and $_ -match 'Ansys Mechanical Pro' }).Count -ge 1)
 
+    # M1: a failed elevated write must be reported, not silently "OK". Every PS
+    # payload sets ErrorActionPreference=Stop and has an exit-1 failure path.
+    $payloadCount = @($decoded).Count
+    Assert "two PS payloads generated (ini + xml)"      ($payloadCount -eq 2)
+    Assert "every payload sets ErrorActionPreference Stop" (@($decoded | Where-Object { $_ -match "ErrorActionPreference = 'Stop'" }).Count -eq $payloadCount)
+    Assert "every payload has an exit 1 failure path"   (@($decoded | Where-Object { $_ -match 'exit 1' }).Count -eq $payloadCount)
+
+    # M4: the elevated XML parse must refuse DTDs (billion-laughs hardening).
+    Assert "xml payload prohibits DTD processing"       (@($decoded | Where-Object { $_ -match 'DtdProcessing' -and $_ -match 'Prohibit' }).Count -ge 1)
+
+    # M3: the ini fix must target the same file the check inspected (the fixture),
+    # not a hardcoded canonical path the running ANSYS may never read.
+    $serverFinding = @($findings | Where-Object { $_.key -eq 'server.ansyslmd_ini' })[0]
+    Assert "server finding carries ini_path of inspected file" ($serverFinding.ini_path -eq $fixtureIni)
+    Assert "ini payload targets the inspected file"     (@($decoded | Where-Object { $_ -match [regex]::Escape($fixtureIni) }).Count -ge 1)
+
+    # --- Scenario 5: M2 elevated-path / key validation ---
+    Write-Host "Scenario 5: M2 path + key validation"
+    Assert "rejects '..' traversal"                     (-not (Test-SafeFixTargetPath 'C:\ANSYS Inc\..\..\Windows\System32\x.ini'))
+    Assert "rejects relative path"                      (-not (Test-SafeFixTargetPath 'foo\bar.ini'))
+    Assert "rejects drive-relative path"                (-not (Test-SafeFixTargetPath 'C:foo.ini'))
+    Assert "rejects empty path"                         (-not (Test-SafeFixTargetPath ''))
+    Assert "accepts fully-qualified local path"         (Test-SafeFixTargetPath 'C:\Program Files\ANSYS Inc\Shared Files\licensing\ansyslmd.ini')
+    Assert "accepts UNC path"                           (Test-SafeFixTargetPath '\\server\share\ansyslmd.ini')
+
+    # A traversal key in requiredLicenseOptions must be skipped, not interpolated
+    # into a path that would then be [xml]-loaded and .Save()-d as admin.
+    $script:ExpectedConfig.RequiredLicenseOptions = @{ '..\..\Evil' = 'X' }
+    $badKeyFindings = Test-AnsysConfig -AnsyslmdIniPath $fixtureIni -AnsysUserAppData $fixtureAppData
+    Assert "traversal app-key yields no licopt finding" (@($badKeyFindings | Where-Object { $_.key -like 'licopt.*' }).Count -eq 0)
+
+    # The bat generator must skip a finding whose target path is unsafe, emitting
+    # no -EncodedCommand for it.
+    $unsafeFinding = @{ key = 'server.ansyslmd_ini'; expected = '1@x'; actual = ''; ini_path = 'C:\x\..\..\Windows\evil.ini' }
+    $unsafeBat = Join-Path $fixtureRoot 'unsafe.bat'
+    [void](New-AnsysConfigFixBat -Findings @($unsafeFinding) -OutPath $unsafeBat)
+    $unsafeText = Get-Content -LiteralPath $unsafeBat -Raw
+    Assert "bat skips unsafe ini target"                ($unsafeText -match 'unsafe target path')
+    Assert "bat emits no command for unsafe target"     ($unsafeText -notmatch '-EncodedCommand')
+
 }
 finally {
     [Environment]::SetEnvironmentVariable($forbiddenEnv, $null, 'User')

@@ -30,7 +30,6 @@ if ($task) {
 # than a bare 'agent.ps1' wildcard so we don't accidentally kill an unrelated
 # powershell.exe that happens to mention the string somewhere in its
 # command line.
-$agentMarker = (Join-Path $InstallDir 'agent.ps1').Replace('\','\\')
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape((Join-Path $InstallDir 'agent.ps1')) } |
     ForEach-Object {

@@ -8,6 +8,11 @@ param([Parameter(Position=0)][string]$Url)
 Set-StrictMode -Version 3.0
 
 $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+# Keep the callback tiny: it spawns on every button click and only needs the
+# queue-write + path/log helpers. This tells common.ps1 to skip its dot-source-
+# time Import-AppConfig, so we don't re-read config.json (and possibly a UNC
+# central config) on each click. Process-scoped env var; gone when this exits.
+$env:ANSYS_ELM_SKIP_AUTOCONFIG = '1'
 . (Join-Path $scriptRoot 'common.ps1')
 
 if ([string]::IsNullOrEmpty($Url)) { exit 0 }
@@ -16,7 +21,7 @@ if ([string]::IsNullOrEmpty($Url)) { exit 0 }
 # so anything else is silently dropped rather than written to the queue. This
 # also keeps the queue from accumulating spam if a stray ansyselastic: URL
 # (e.g. handcrafted by another app) hits the handler.
-$AllowedActions = @('got_it','suppress','accept','snooze','fix_config','ignore_config')
+$AllowedActions = @('got_it','suppress','accept','snooze','fix_config','ignore_config','view_triggers','open_log')
 
 # Expected: ansyselastic:<action>?session=<urlencoded-key>
 # Bound key length so a pathological URL can't blow up the queue file.
