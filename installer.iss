@@ -75,6 +75,10 @@ SolidCompression=yes
 WizardStyle=modern
 Uninstallable=yes
 UsePreviousAppDir=yes
+; Icon on Setup.exe (and the uninstaller), and on the Installed Apps entry.
+; Regenerate assets\icon.ico from assets\icon.png with build-icon.ps1.
+SetupIconFile=assets\icon.ico
+UninstallDisplayIcon={app}\icon.ico
 ; CloseApplications=yes asks Restart Manager to close apps holding our files
 ; open. It rarely fires: powershell.exe reads agent.ps1 and closes it, so the
 ; running agent holds no lock. Inno also does not run the prior uninstaller on
@@ -92,6 +96,7 @@ Source: "toast-callback.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "toast-callback.vbs"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE";            DestDir: "{app}"; Flags: ignoreversion
 Source: "VERSION";            DestDir: "{app}"; Flags: ignoreversion
+Source: "assets\icon.ico";    DestDir: "{app}"; Flags: ignoreversion
 ; config.json: onlyifdoesntexist preserves admin/user edits across upgrades.
 ; A reinstall over the top will NOT clobber a customised config. To force
 ; replacement, uninstall first (which wipes {app}) then re-run setup.
@@ -105,7 +110,7 @@ Source: "trigger-check.cmd";  DestDir: "{app}"; Flags: ignoreversion
 
 #if DebugBuild == "1"
 [Icons]
-Name: "{group}\Run ANSYS checks now (Debug)"; Filename: "{app}\trigger-check.cmd"; WorkingDir: "{app}"
+Name: "{group}\Run ANSYS checks now (Debug)"; Filename: "{app}\trigger-check.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"
 #endif
 
 [Messages]

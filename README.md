@@ -23,6 +23,8 @@ Currently distributed unsigned — first run hits Windows SmartScreen ("Windows 
 | `install.ps1` | Copies files to `%LOCALAPPDATA%\AnsysElasticLicenceMonitor\`, installs BurntToast, registers scheduled task + URL protocol, starts the task. Skips its own copy step when invoked from inside the install dir (the Inno post-install path). `config.json` is copy-only-if-absent so admin edits survive re-install. |
 | `uninstall.ps1` | Reverses install (task, registry, install dir). `-SkipDirRemoval` skips the dir wipe so Inno can own it during installer-driven uninstall. Leaves BurntToast module in place. |
 | `installer.iss` | Inno Setup 6 script that builds `dist\AnsysElasticLicenceMonitor-Setup.exe`. Bundles the agent files, runs `install.ps1` post-install, runs `uninstall.ps1 -SkipDirRemoval` on uninstall. |
+| `assets/icon.png`, `assets/icon.ico` | Installer and Installed Apps icon. Replace the PNG and run `build-icon.ps1` to regenerate the .ico. |
+| `build-icon.ps1` | Builds the multi-size `assets/icon.ico` (16 to 256 px) from `assets/icon.png` |
 | `sample-acl-log.log` | Fixture for offline regex test (4 elastic events + 4 perpetual events) |
 | `test-parser.ps1` | Validates regex against fixture |
 | `test-perpetual.ps1` | Probes lmutil + perpetual context parser for each feature |
